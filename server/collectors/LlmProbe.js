@@ -313,6 +313,16 @@ export class LlmProbe {
             /* body optional for detection */
           }
         }
+        // llama-server reports owned_by "llamacpp". If the /slots probe
+        // failed transiently (server busy or waking from --sleep-idle-seconds),
+        // the fallback must not classify it as vLLM: that misdetection is
+        // sticky (the anti-404-spam guard above never re-probes /slots for
+        // "vllm") and blanks every metric tile.
+        if (typeof owned === "string" && /llama[._-]?cpp/i.test(owned)) {
+          this.serverIsOpenAI = false;
+          this.backendType = "llama.cpp";
+          return;
+        }
         this.backendType = await this._classifyOpenAIBackend(owned);
         return;
       }
