@@ -73,9 +73,10 @@ export function LlmDailyChart({
         <p className="text-[10px] text-muted">No busy samples in the last 14 days.</p>
       ) : (
         <svg
-          width={CHART_W}
+          viewBox={`0 0 ${CHART_W} ${CHART_H}`}
+          preserveAspectRatio="none"
           height={CHART_H}
-          className="block max-w-full"
+          className="block w-full"
           role="img"
           aria-label="Daily peak decode and prefill tokens per second"
         >
