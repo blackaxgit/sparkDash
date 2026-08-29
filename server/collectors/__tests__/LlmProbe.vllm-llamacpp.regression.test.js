@@ -226,15 +226,18 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async () => {
   probe.authOpen = true;
   probe._lastDetectAt = Date.now();
   probe.lastProbeTime = Date.now() - 2000;
-  probe.slotState.set(0, { decoded: 10, prompted: 5 });
+  let poll = 0;
   probe._fetch = async (url) => {
     const u = String(url);
     if (u.endsWith("/slots")) {
+      poll += 1;
+      const first = poll === 1;
       return jsonRes([
         {
           id: 0,
-          n_decoded: 50,
-          n_prompt_tokens_processed: 25,
+          id_task: 7,
+          n_decoded: first ? 10 : 50,
+          n_prompt_tokens_processed: first ? 5 : 25,
           is_processing: true,
           state: "busy",
         },
@@ -253,6 +256,8 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async () => {
     return jsonRes({}, 404);
   };
 
+  await probe.probe(); // baseline poll: same task, counters 10/5
+  probe.lastProbeTime = Date.now() - 2000;
   const snap = await probe.probe();
   assert.equal(snap.backend, "llama.cpp");
   assert.equal(snap.modelId, "Qwen2.5-7B");
@@ -275,17 +280,19 @@ test("llama.cpp probe: n_prompt_tokens_cache → cached vs uncached prefill", as
   probe.authOpen = true;
   probe._lastDetectAt = Date.now();
   probe.lastProbeTime = Date.now() - 2000;
-  probe.slotState.set(0, { decoded: 10, prompted: 5 });
-  probe.lastPrefillKinds = { cached: 10, computed: 5 };
+  let poll = 0;
   probe._fetch = async (url) => {
     const u = String(url);
     if (u.endsWith("/slots")) {
+      poll += 1;
+      const first = poll === 1;
       return jsonRes([
         {
           id: 0,
-          n_decoded: 50,
-          n_prompt_tokens_processed: 25,
-          n_prompt_tokens_cache: 40,
+          id_task: 7,
+          n_decoded: first ? 10 : 50,
+          n_prompt_tokens_processed: first ? 5 : 25,
+          n_prompt_tokens_cache: first ? 10 : 40,
           is_processing: true,
         },
       ]);
@@ -293,6 +300,8 @@ test("llama.cpp probe: n_prompt_tokens_cache → cached vs uncached prefill", as
     if (u.endsWith("/props")) return jsonRes({ model_alias: "m" });
     return jsonRes({}, 404);
   };
+  await probe.probe(); // baseline poll
+  probe.lastProbeTime = Date.now() - 2000;
   const snap = await probe.probe();
   assert.equal(snap.prefillTps, 10); // processed (25-5)/2
   assert.equal(snap.uncachedPrefillTps, 10); // (25-5)/2
@@ -306,18 +315,20 @@ test("llama.cpp: n_prompt_tokens_processed 0 is not treated as missing", async (
   probe.authOpen = true;
   probe._lastDetectAt = Date.now();
   probe.lastProbeTime = Date.now() - 2000;
-  probe.slotState.set(0, { decoded: 10, prompted: 0 });
-  probe.lastPrefillKinds = { cached: 10, computed: 0 };
+  let poll = 0;
   probe._fetch = async (url) => {
     const u = String(url);
     if (u.endsWith("/slots")) {
+      poll += 1;
+      const first = poll === 1;
       return jsonRes([
         {
           id: 0,
+          id_task: 7,
           n_decoded: 10,
           n_prompt_tokens_processed: 0,
           n_prompt_tokens: 100,
-          n_prompt_tokens_cache: 100,
+          n_prompt_tokens_cache: first ? 10 : 100,
           state: "idle",
         },
       ]);
@@ -325,6 +336,8 @@ test("llama.cpp: n_prompt_tokens_processed 0 is not treated as missing", async (
     if (u.endsWith("/props")) return jsonRes({ model_alias: "m" });
     return jsonRes({}, 404);
   };
+  await probe.probe(); // baseline poll
+  probe.lastProbeTime = Date.now() - 2000;
   const snap = await probe.probe();
   assert.equal(snap.uncachedPrefillTps, 0);
   assert.equal(snap.cachedPrefillTps, 45); // (100-10)/2

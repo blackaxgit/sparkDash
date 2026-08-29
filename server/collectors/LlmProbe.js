@@ -84,6 +84,9 @@ export class LlmProbe {
 
     // Per-slot rate tracking (for llama.cpp native path)
     this.slotState = new Map();
+    /** Monotonic prefill counters rebuilt from same-task slot deltas (llama.cpp). */
+    this._llamaCachedCum = 0;
+    this._llamaComputedCum = 0;
     this.lastTokenCounts = { input: 0, output: 0 };
     /** Previous prefill counters by kind; null until first labeled sample. */
     this.lastPrefillKinds = null;
@@ -245,6 +248,8 @@ export class LlmProbe {
     this.itlP95Seconds = null;
     this.mtpAcceptanceRate = null;
     this.slotState.clear();
+    this._llamaCachedCum = 0;
+    this._llamaComputedCum = 0;
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
     this.lastTtftSum = null;
@@ -1080,8 +1085,6 @@ export class LlmProbe {
           let totalGen = 0;
           let totalPrefill = 0;
           let totalDecoded = 0;
-          let promptedSum = 0;
-          let cachedSum = 0;
           let sawCache = false;
 
           for (const slot of slots) {
@@ -1089,26 +1092,35 @@ export class LlmProbe {
             const decoded = this._getSlotDecoded(slot);
             const prompted = this._getSlotPrefilled(slot);
             const cached = this._getSlotCached(slot);
+            const taskId = slot.id_task ?? null;
             totalDecoded += decoded;
-            promptedSum += prompted;
-            if (cached != null) {
-              sawCache = true;
-              cachedSum += cached;
-            }
-            const lastState = this.slotState.get(slotId) || { decoded: 0, prompted: 0 };
+            if (cached != null) sawCache = true;
+            const lastState = this.slotState.get(slotId);
+            this.slotState.set(slotId, { decoded, prompted, cached: cached ?? 0, taskId });
+            // Slot counters are per-task: a delta is only a rate while the
+            // same task stays on the slot. First contact and task switches
+            // contribute nothing this interval — otherwise a slot mid-task
+            // counts its whole history (largely prompt-cache hits) inside one
+            // poll and poisons the daily peaks with impossible tok/s spikes.
+            if (lastState == null || lastState.taskId !== taskId) continue;
+            if (!(dtSec > 0 && dtSec < 10)) continue;
             const dDecoded = decoded - lastState.decoded;
             const dPrompted = prompted - lastState.prompted;
-            this.slotState.set(slotId, { decoded, prompted });
-            if (dtSec > 0 && dtSec < 10) {
-              totalGen += dDecoded / dtSec;
+            if (dDecoded > 0) totalGen += dDecoded / dtSec;
+            if (dPrompted > 0) {
               totalPrefill += dPrompted / dtSec;
+              this._llamaComputedCum += dPrompted;
+            }
+            if (cached != null) {
+              const dCached = cached - (lastState.cached || 0);
+              if (dCached > 0) this._llamaCachedCum += dCached;
             }
           }
 
           this.totalOutputTokens = totalDecoded;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
-          if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
+          if (sawCache) this._setPrefillSplitRates(this._llamaCachedCum, this._llamaComputedCum, dtSec);
         }
       }
     } catch {}
