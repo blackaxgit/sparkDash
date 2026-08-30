@@ -19,6 +19,8 @@ const DEFAULTS = Object.freeze({
   benchDebugTraces: false,
   /** Layout density — compact (default) or comfortable. */
   density: "compact",
+  /** Services cards — side-by-side grid (default) or full-width rows. */
+  servicesLayout: "grid",
 });
 
 /** @type {typeof DEFAULTS} */
@@ -45,6 +47,10 @@ function _clampSettings(settings) {
   // Ensure density is valid
   if (s.density !== "comfortable" && s.density !== "compact") {
     s.density = DEFAULTS.density;
+  }
+  // Ensure servicesLayout is valid
+  if (s.servicesLayout !== "grid" && s.servicesLayout !== "rows") {
+    s.servicesLayout = DEFAULTS.servicesLayout;
   }
   return s;
 }

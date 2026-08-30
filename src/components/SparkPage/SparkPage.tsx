@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type CSSProperties } from "react";
+import { useState, useEffect, useCallback, type CSSProperties, type ReactNode } from "react";
 import type { SparkSnapshot } from "../../api/types";
 import { isLlmMonitoringEnabled } from "../../api/sparkRole";
 import { updateSpark, refreshSparkMetric, addLlmPort, removeLlmPort } from "../../api/client";
@@ -11,11 +11,14 @@ import { NetworkPanel } from "./NetworkPanel";
 import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
-import { ChevronDownIcon } from "../ui/icons";
+import { ChevronDownIcon, ColumnsIcon, RowsIcon } from "../ui/icons";
 
 interface SparkPageProps {
   spark: SparkSnapshot;
   temperatureUnit: "celsius" | "fahrenheit";
+  /** Persisted server-side, so the choice follows the user across browsers. */
+  servicesLayout?: "grid" | "rows";
+  onServicesLayoutChange?: (next: "grid" | "rows") => void;
   onEdit?: () => void;
 }
 
@@ -49,34 +52,42 @@ function SectionHeading({
   open,
   onToggle,
   style,
+  actions,
 }: {
   title: string;
   open: boolean;
   onToggle: () => void;
   style?: CSSProperties;
+  actions?: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={open}
-      className="md:col-span-2 flex w-full items-center gap-2 text-left font-normal leading-tight tracking-tight text-text-strong transition-colors hover:text-accent"
-      style={{
-        fontSize: "var(--density-overview-title)",
-        ...style,
-      }}
-    >
-      <ChevronDownIcon
-        className={`h-5 w-5 shrink-0 text-muted transition-transform duration-150 ${
-          open ? "" : "-rotate-90"
-        }`}
-      />
-      <span>{title}</span>
-    </button>
+    <div className="md:col-span-2 flex w-full items-center gap-2" style={style}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex flex-1 items-center gap-2 text-left font-normal leading-tight tracking-tight text-text-strong transition-colors hover:text-accent"
+        style={{ fontSize: "var(--density-overview-title)" }}
+      >
+        <ChevronDownIcon
+          className={`h-5 w-5 shrink-0 text-muted transition-transform duration-150 ${
+            open ? "" : "-rotate-90"
+          }`}
+        />
+        <span>{title}</span>
+      </button>
+      {actions}
+    </div>
   );
 }
 
-export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
+export function SparkPage({
+  spark,
+  temperatureUnit,
+  servicesLayout = "grid",
+  onServicesLayoutChange,
+  onEdit,
+}: SparkPageProps) {
   const { metrics } = spark;
   const [disabledDevices, setDisabledDevices] = useState<string[]>(spark.disabledDevices || []);
   const [disabledInterfaces, setDisabledInterfaces] = useState<string[]>(
@@ -188,8 +199,36 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
    */
   const serviceCardCount = (llmOn ? llmPorts.length : 0) + (comfyOn ? 1 : 0);
   const spansFullWidth = (index: number) =>
-    serviceCardCount % 2 === 1 && index === serviceCardCount - 1;
+    servicesLayout === "rows" ||
+    (serviceCardCount % 2 === 1 && index === serviceCardCount - 1);
   const comfyCardIndex = llmOn ? llmPorts.length : 0;
+
+  /** Both layouts look identical with a single card, so only offer the choice above one. */
+  const servicesLayoutToggle =
+    serviceCardCount > 1 && onServicesLayoutChange ? (
+      <div className="flex items-center gap-0.5" role="group" aria-label="Services layout">
+        {([
+          ["grid", ColumnsIcon, "Side-by-side"],
+          ["rows", RowsIcon, "Stacked rows"],
+        ] as const).map(([mode, Icon, label]) => (
+          <button
+            key={mode}
+            type="button"
+            onClick={() => onServicesLayoutChange(mode)}
+            aria-pressed={servicesLayout === mode}
+            aria-label={label}
+            title={label}
+            className={`rounded p-1 transition-colors ${
+              servicesLayout === mode
+                ? "text-accent"
+                : "text-muted hover:text-text-strong"
+            }`}
+          >
+            <Icon className="h-4 w-4" />
+          </button>
+        ))}
+      </div>
+    ) : null;
 
   const renderLlmPanel = (port: number, portIndex: number, className?: string) => {
     const llmMetrics = metrics.llm?.[portIndex] ?? null;
@@ -295,6 +334,7 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
             open={servicesOpen}
             onToggle={toggleServices}
             style={{ marginTop: "var(--density-page-gap)" }}
+            actions={servicesLayoutToggle}
           />
         )}
         {showServices && servicesOpen && (

@@ -535,6 +535,8 @@ export interface Settings {
   benchDebugTraces: boolean;
   /** Layout density — compact (default) or comfortable. */
   density: "comfortable" | "compact";
+  /** Services cards — side-by-side grid (default) or full-width rows. */
+  servicesLayout: "grid" | "rows";
 }
 
 export interface SparksListResponse {
