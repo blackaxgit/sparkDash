@@ -250,7 +250,7 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async () => {
         total_context_length: 32768,
       });
     }
-    if (u.includes("get_server_info") || u.endsWith("/metrics")) {
+    if (u.includes("get_server_info") || u.includes("server_info")) {
       assert.fail("llama.cpp path must not use OpenAI/ds4/sglang endpoints");
     }
     return jsonRes({}, 404);

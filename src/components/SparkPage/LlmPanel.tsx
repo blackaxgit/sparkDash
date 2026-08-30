@@ -7,6 +7,7 @@ import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { LlmDailyChart } from "./LlmDailyChart";
+import { LlmHourlyChart } from "./LlmHourlyChart";
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
@@ -424,6 +425,7 @@ export function LlmPanel({
               Showcase
             </button>
             <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+            <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
           </div>
         </div>
       ) : (
@@ -500,6 +502,7 @@ export function LlmPanel({
           )}
 
           <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+            <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
 
           <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
             <div className="space-y-0.5">

@@ -343,6 +343,18 @@ export interface LlmDailyResponse {
   days: LlmDailyDay[];
 }
 
+/** One UTC hour of generated-token volume. `hour` is "YYYY-MM-DDTHH". */
+export interface LlmHourlyBucket {
+  hour: string;
+  tokens: number;
+}
+
+export interface LlmHourlyResponse {
+  sparkId: string;
+  port: number;
+  hours: LlmHourlyBucket[];
+}
+
 /** Security posture badge payload from LlmProbe. */
 export interface LlmPosture {
   /** ok = green, warn = amber, danger = red */

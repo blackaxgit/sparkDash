@@ -87,6 +87,8 @@ export class LlmProbe {
     /** Monotonic prefill counters rebuilt from same-task slot deltas (llama.cpp). */
     this._llamaCachedCum = 0;
     this._llamaComputedCum = 0;
+    /** null = untried, false = server has no /metrics (don't re-probe). */
+    this._llamaMetricsOk = null;
     this.lastTokenCounts = { input: 0, output: 0 };
     /** Previous prefill counters by kind; null until first labeled sample. */
     this.lastPrefillKinds = null;
@@ -250,6 +252,8 @@ export class LlmProbe {
     this.slotState.clear();
     this._llamaCachedCum = 0;
     this._llamaComputedCum = 0;
+    /** null = untried, false = server has no /metrics (don't re-probe). */
+    this._llamaMetricsOk = null;
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
     this.lastTtftSum = null;
@@ -1144,6 +1148,25 @@ export class LlmProbe {
         this.contextLength = props.total_context_length || props.context_length || this.contextLength;
       }
     } catch {}
+
+    // Monotonic token counter. The per-slot n_decoded sum resets whenever a
+    // slot picks up a new task, so it cannot be diffed into token volume.
+    if (this._llamaMetricsOk !== false) {
+      try {
+        const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+        if (metricsRes.ok) {
+          this._llamaMetricsOk = true;
+          const txt = await metricsRes.text();
+          const predicted = this._getPromMetric(txt, "llamacpp:tokens_predicted_total");
+          if (predicted != null && Number.isFinite(predicted)) {
+            this.totalOutputTokens = predicted;
+          }
+        } else if (metricsRes.status === 404 || metricsRes.status === 501) {
+          // Server started without --metrics; stop asking every poll.
+          this._llamaMetricsOk = false;
+        }
+      } catch {}
+    }
 
     this.backendType = "llama.cpp";
     return this._getSnapshot();
