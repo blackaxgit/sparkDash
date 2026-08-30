@@ -177,22 +177,19 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
   const llmOn = isLlmMonitoringEnabled(spark);
   const comfyOn = Boolean(spark.comfyMonitoring);
   const tailscaleOn = Boolean(spark.tailscaleMonitoring);
-  /** First LLM + Comfy share a row when both are on. */
-  const primarySideBySide = llmOn && comfyOn;
   const showServices = llmOn || comfyOn;
   const primaryPort = llmPorts[0];
   const extraPorts = llmPorts.slice(1);
 
   /**
-   * Extra LLM ports (after the primary):
-   * - 1 extra → full-width own row
-   * - 2+ extras → 2-column pairs; if odd count, last one full-width alone
+   * Service cards flow through a 2-column grid in render order: every LLM port,
+   * then ComfyUI. They pair up half-and-half; only a trailing odd card spans
+   * both columns so it doesn't sit alone at half width.
    */
-  const extraLlmFullWidth = (extraIndex: number, extraCount: number) => {
-    if (extraCount === 1) return true;
-    if (extraCount % 2 === 1 && extraIndex === extraCount - 1) return true;
-    return false;
-  };
+  const serviceCardCount = (llmOn ? llmPorts.length : 0) + (comfyOn ? 1 : 0);
+  const spansFullWidth = (index: number) =>
+    serviceCardCount % 2 === 1 && index === serviceCardCount - 1;
+  const comfyCardIndex = llmOn ? llmPorts.length : 0;
 
   const renderLlmPanel = (port: number, portIndex: number, className?: string) => {
     const llmMetrics = metrics.llm?.[portIndex] ?? null;
@@ -289,11 +286,8 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
           </>
         )}
         {/*
-          Services layout:
-          - Primary LLM + ComfyUI → always same row, 2 columns (when both on)
-          - Alone → full width
-          - +1 LLM → own full-width row
-          - +2 LLMs → 2-column row; odd leftover → full-width row
+          Services layout: LLM ports then ComfyUI, filling a 2-column grid
+          50/50; a trailing odd card spans the full width.
         */}
         {showServices && (
           <SectionHeading
@@ -310,7 +304,7 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
               renderLlmPanel(
                 primaryPort,
                 0,
-                primarySideBySide ? undefined : "md:col-span-2"
+                spansFullWidth(0) ? "md:col-span-2" : undefined
               )}
             {comfyOn && (
               <ComfyPanel
@@ -318,7 +312,7 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
                 comfyPort={spark.comfyPort ?? 8188}
                 sparkId={spark.id}
                 lanIp={spark.lanIp}
-                className={primarySideBySide ? undefined : "md:col-span-2"}
+                className={spansFullWidth(comfyCardIndex) ? "md:col-span-2" : undefined}
               />
             )}
             {llmOn &&
@@ -326,7 +320,7 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
                 renderLlmPanel(
                   port,
                   j + 1,
-                  extraLlmFullWidth(j, extraPorts.length) ? "md:col-span-2" : undefined
+                  spansFullWidth(j + 1) ? "md:col-span-2" : undefined
                 )
               )}
             {llmOn &&
