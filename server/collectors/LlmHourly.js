@@ -84,7 +84,7 @@ export class LlmHourlyStore {
   /**
    * @param {string} sparkId
    * @param {number} port
-   * @param {{ available?: boolean, totalOutputTokens?: number }} metrics
+   * @param {{ available?: boolean, cumulativeOutputTokens?: number|null }} metrics
    * @param {Date} [now]
    */
   record(sparkId, port, metrics, now = new Date()) {
@@ -96,7 +96,11 @@ export class LlmHourlyStore {
       return;
     }
 
-    const total = Number(metrics.totalOutputTokens);
+    // Only the backend's monotonic counter may be diffed. When it is missing
+    // (e.g. /metrics timed out) skip the poll and keep the baseline: the
+    // counter is monotonic, so the next good sample still measures the gap.
+    if (metrics.cumulativeOutputTokens == null) return;
+    const total = Number(metrics.cumulativeOutputTokens);
     if (!Number.isFinite(total) || total < 0) return;
 
     const prev = this._last.get(key);

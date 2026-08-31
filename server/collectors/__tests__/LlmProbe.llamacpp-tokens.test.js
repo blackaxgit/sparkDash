@@ -59,3 +59,18 @@ test("llama.cpp: falls back to the slot sum when /metrics is absent, and stops r
   assert.equal(second.totalOutputTokens, 19000);
   assert.equal(metricsCalls, 1, "a 404 on /metrics must not be retried every poll");
 });
+
+test("llama.cpp: no cumulative counter is reported when /metrics is unavailable", async () => {
+  // The slot-sum fallback keeps the TOTAL GENERATED tile alive, but it is a
+  // different series and must not leak into hourly token volume.
+  const probe = mkProbe(() => res({}, 404, true));
+  const snap = await probe._probeLlamaCpp();
+  assert.equal(snap.totalOutputTokens, 19000);
+  assert.equal(snap.cumulativeOutputTokens, null);
+});
+
+test("llama.cpp: the cumulative counter is the Prometheus value, not the slot sum", async () => {
+  const probe = mkProbe(() => res(METRICS));
+  const snap = await probe._probeLlamaCpp();
+  assert.equal(snap.cumulativeOutputTokens, 462911);
+});

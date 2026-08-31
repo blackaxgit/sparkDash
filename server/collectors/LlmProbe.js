@@ -89,6 +89,8 @@ export class LlmProbe {
     this._llamaComputedCum = 0;
     /** null = untried, false = server has no /metrics (don't re-probe). */
     this._llamaMetricsOk = null;
+    /** Monotonic tokens_predicted_total; null when /metrics did not answer. */
+    this._llamaCumulative = null;
     this.lastTokenCounts = { input: 0, output: 0 };
     /** Previous prefill counters by kind; null until first labeled sample. */
     this.lastPrefillKinds = null;
@@ -254,6 +256,8 @@ export class LlmProbe {
     this._llamaComputedCum = 0;
     /** null = untried, false = server has no /metrics (don't re-probe). */
     this._llamaMetricsOk = null;
+    /** Monotonic tokens_predicted_total; null when /metrics did not answer. */
+    this._llamaCumulative = null;
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
     this.lastTtftSum = null;
@@ -1066,6 +1070,7 @@ export class LlmProbe {
 
   // ─── llama.cpp native path ────────────────────────────────
   async _probeLlamaCpp() {
+    this._llamaCumulative = null;
     const now = Date.now();
     const dtSec = (now - this.lastProbeTime) / 1000;
     this.lastProbeTime = now;
@@ -1160,6 +1165,7 @@ export class LlmProbe {
           const predicted = this._getPromMetric(txt, "llamacpp:tokens_predicted_total");
           if (predicted != null && Number.isFinite(predicted)) {
             this.totalOutputTokens = predicted;
+            this._llamaCumulative = predicted;
           }
         } else if (metricsRes.status === 404 || metricsRes.status === 501) {
           // Server started without --metrics; stop asking every poll.
@@ -1405,6 +1411,8 @@ export class LlmProbe {
       cachedPrefillTps: this.cachedPrefillTps,
       uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
+      cumulativeOutputTokens:
+        this.backendType === "llama.cpp" ? this._llamaCumulative : this.totalOutputTokens,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
