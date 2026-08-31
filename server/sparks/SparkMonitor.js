@@ -5,7 +5,6 @@ import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
-import { llmDaily } from "../collectors/LlmDaily.js";
 import { llmHourly } from "../collectors/LlmHourly.js";
 import { sshTest, sshExec } from "../collectors/ssh.js";
 import {
@@ -590,7 +589,6 @@ export class SparkMonitor {
             for (let i = 0; i < result.length; i++) {
               const probe = probes[i];
               if (probe) {
-                llmDaily.record(this.spark.id, probe.port, result[i]);
                 llmHourly.record(this.spark.id, probe.port, result[i]);
               }
             }
