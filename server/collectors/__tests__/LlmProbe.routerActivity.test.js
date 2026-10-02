@@ -480,7 +480,7 @@ test("routerLoad: GET /upstream/{model}/health, one load in flight, flag cleared
   }
 });
 
-test("dispose: aborts the pending model load and refuses new ones", async () => {
+test("dispose: aborts the pending model load and leaves the probe restartable", async () => {
   const probe = new LlmProbe({ isLocal: true }, 11434);
   let signal;
   probe._fetch = (url, opts) => {
@@ -500,7 +500,11 @@ test("dispose: aborts the pending model load and refuses new ones", async () => 
     assert.equal(signal.aborted, true, "the 20-minute request does not outlive the probe");
     await new Promise((r) => setImmediate(r));
     assert.equal(probe.isLoadInFlight(), false);
-    assert.deepEqual(probe.routerLoad("other"), { started: false, reason: "disposed" });
+    // A stopped monitor reuses its probes on start(), so dispose() is not terminal.
+    assert.deepEqual(probe.routerLoad("other"), { started: true });
+    probe.dispose();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(probe.isLoadInFlight(), false);
   } finally {
     console.log = log;
   }
@@ -521,6 +525,24 @@ test("dispose: a feed read that finishes afterwards does not update the probe", 
   release();
   await settle();
   assert.equal(probe.routerActivity, null);
+});
+
+test("a feed read that started before a router reset cannot repopulate the cleared state", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  let release;
+  const state = {
+    running: [EMBEDDER],
+    prompt: 0,
+    activity: () => new Promise((resolve) => (release = () => resolve(jsonRes({ data: [] })))),
+  };
+  probe._fetch = pollingFetch(state).fetch;
+  await probe.probe();
+  await settle();
+  probe._resetDetection();
+  release();
+  await settle();
+  assert.equal(probe.routerActivity, null);
+  assert.equal(probe._activityRun, null, "the stale run's finally() must not leave a guard behind");
 });
 
 test("re-detecting away from llama-swap clears the router feed state", async () => {

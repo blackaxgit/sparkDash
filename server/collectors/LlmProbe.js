@@ -154,8 +154,11 @@ export class LlmProbe {
     this._routerLoadInFlight = false;
     /** Aborts the outstanding model load; null when none is in flight. */
     this._routerLoadAbort = null;
-    /** Set by dispose(): the monitor is gone, so background work must not touch state. */
-    this._disposed = false;
+    /**
+     * Bumped by _clearRouter() and dispose(). A background read or load that
+     * started under an older generation must not write state when it lands.
+     */
+    this._routerGen = 0;
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
     this.stepId = 0;
@@ -372,6 +375,7 @@ export class LlmProbe {
     this._modelsNextAt = 0;
     this._activityRun = null;
     this._modelsRun = null;
+    this._routerGen += 1;
     this._feedHealth = { activity: { fails: 0, failing: false }, models: { fails: 0, failing: false } };
   }
 
@@ -817,12 +821,18 @@ export class LlmProbe {
     this._routerPrev = diff.state;
     this.routerEvents = diff.events;
     // Slow, non-essential feeds: never hold up the 2 s poll. Each is single-flight.
-    this._activityRun ??= this._refreshRouterActivity(polledAt).finally(() => {
-      this._activityRun = null;
-    });
-    this._modelsRun ??= this._refreshRouterModels(polledAt).finally(() => {
-      this._modelsRun = null;
-    });
+    if (!this._activityRun) {
+      const run = this._refreshRouterActivity(polledAt).finally(() => {
+        if (this._activityRun === run) this._activityRun = null;
+      });
+      this._activityRun = run;
+    }
+    if (!this._modelsRun) {
+      const run = this._refreshRouterModels(polledAt).finally(() => {
+        if (this._modelsRun === run) this._modelsRun = null;
+      });
+      this._modelsRun = run;
+    }
 
     // A ComfyUI studio is a llama-swap member but not an LLM engine: it has no
     // /metrics and no chat API, so it must stay out of engine selection, the
@@ -1062,6 +1072,7 @@ export class LlmProbe {
   async _refreshRouterActivity(now) {
     if (now < this._activityNextAt) return;
     this._activityNextAt = now + ROUTER_REFRESH_MS;
+    const gen = this._routerGen;
     const path = "/api/metrics/activity";
     let failure = null;
     try {
@@ -1072,13 +1083,13 @@ export class LlmProbe {
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
         if (res.status === 404) {
-          this._activityNextAt = now + ACTIVITY_MISSING_BACKOFF_MS;
+          if (gen === this._routerGen) this._activityNextAt = now + ACTIVITY_MISSING_BACKOFF_MS;
           return;
         }
         failure = `HTTP ${res.status}`;
       } else {
         const body = await readJsonCapped(res, ACTIVITY_MAX_BYTES);
-        if (this._disposed) return;
+        if (gen !== this._routerGen) return;
         const activity = buildRouterActivity(body, now);
         if (activity) this.routerActivity = activity;
         else failure = "unexpected payload";
@@ -1086,7 +1097,7 @@ export class LlmProbe {
     } catch (err) {
       failure = err?.message || String(err);
     }
-    if (this._disposed) return;
+    if (gen !== this._routerGen) return;
     const backoff = this._noteRouterFeed("activity", failure, path);
     if (backoff) this._activityNextAt = now + backoff;
   }
@@ -1095,6 +1106,7 @@ export class LlmProbe {
   async _refreshRouterModels(now) {
     if (now < this._modelsNextAt) return;
     this._modelsNextAt = now + ROUTER_REFRESH_MS;
+    const gen = this._routerGen;
     const path = "/v1/models";
     let failure = null;
     try {
@@ -1104,7 +1116,7 @@ export class LlmProbe {
         failure = `HTTP ${res.status}`;
       } else {
         const body = await readJsonCapped(res, MODELS_MAX_BYTES);
-        if (this._disposed) return;
+        if (gen !== this._routerGen) return;
         const models = parseRouterModels(body);
         if (models) this.routerModels = models;
         else failure = "unexpected payload";
@@ -1112,7 +1124,7 @@ export class LlmProbe {
     } catch (err) {
       failure = err?.message || String(err);
     }
-    if (this._disposed) return;
+    if (gen !== this._routerGen) return;
     const backoff = this._noteRouterFeed("models", failure, path);
     if (backoff) this._modelsNextAt = now + backoff;
   }
@@ -1156,15 +1168,15 @@ export class LlmProbe {
    * Ask llama-swap to load one model by requesting its health endpoint, which
    * blocks until the model is up. Fire-and-forget; one load in flight per probe.
    * @param {string} model
-   * @returns {{started: true} | {started: false, reason: "busy" | "invalid" | "disposed"}}
+   * @returns {{started: true} | {started: false, reason: "busy" | "invalid"}}
    */
   routerLoad(model) {
     if (!isSafePathId(model)) return { started: false, reason: "invalid" };
-    if (this._disposed) return { started: false, reason: "disposed" };
     if (this._routerLoadInFlight) return { started: false, reason: "busy" };
     this._routerLoadInFlight = true;
     const abort = new AbortController();
     this._routerLoadAbort = abort;
+    const gen = this._routerGen;
     const t0 = Date.now();
     void (async () => {
       try {
@@ -1179,15 +1191,19 @@ export class LlmProbe {
       } finally {
         this._routerLoadInFlight = false;
         if (this._routerLoadAbort === abort) this._routerLoadAbort = null;
-        if (!this._disposed) this._modelsNextAt = 0;
+        if (gen === this._routerGen) this._modelsNextAt = 0;
       }
     })();
     return { started: true };
   }
 
-  /** Stop all background activity for this probe: abort an in-flight model load and freeze the router feeds. */
+  /**
+   * Stop background work for this probe: abort an in-flight model load and
+   * discard any feed read still in flight. The probe stays usable, so a
+   * stopped monitor can start it again.
+   */
   dispose() {
-    this._disposed = true;
+    this._routerGen += 1;
     this._routerLoadAbort?.abort();
     this._routerLoadAbort = null;
   }
