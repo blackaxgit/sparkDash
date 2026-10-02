@@ -806,6 +806,9 @@ export class LlmProbe {
    * @param {number} dtSec
    */
   async _probeSwapRouter(dtSec) {
+    // A dispose() or router reset while /running is in flight makes this poll stale
+    // for the router feed state; it may still report the engine below.
+    const gen = this._routerGen;
     let rows = null;
     try {
       const res = await this._fetch(`${this.baseUrl}/running`);
@@ -816,22 +819,24 @@ export class LlmProbe {
     }
     if (rows == null) throw new Error("llama-swap /running unreachable");
     const polledAt = Date.now();
-    this._routerRows = rows;
-    const diff = diffRouterRows(this._routerPrev, rows, polledAt, this.routerEvents);
-    this._routerPrev = diff.state;
-    this.routerEvents = diff.events;
-    // Slow, non-essential feeds: never hold up the 2 s poll. Each is single-flight.
-    if (!this._activityRun) {
-      const run = this._refreshRouterActivity(polledAt).finally(() => {
-        if (this._activityRun === run) this._activityRun = null;
-      });
-      this._activityRun = run;
-    }
-    if (!this._modelsRun) {
-      const run = this._refreshRouterModels(polledAt).finally(() => {
-        if (this._modelsRun === run) this._modelsRun = null;
-      });
-      this._modelsRun = run;
+    if (gen === this._routerGen) {
+      this._routerRows = rows;
+      const diff = diffRouterRows(this._routerPrev, rows, polledAt, this.routerEvents);
+      this._routerPrev = diff.state;
+      this.routerEvents = diff.events;
+      // Slow, non-essential feeds: never hold up the 2 s poll. Each is single-flight.
+      if (!this._activityRun) {
+        const run = this._refreshRouterActivity(polledAt).finally(() => {
+          if (this._activityRun === run) this._activityRun = null;
+        });
+        this._activityRun = run;
+      }
+      if (!this._modelsRun) {
+        const run = this._refreshRouterModels(polledAt).finally(() => {
+          if (this._modelsRun === run) this._modelsRun = null;
+        });
+        this._modelsRun = run;
+      }
     }
 
     // A ComfyUI studio is a llama-swap member but not an LLM engine: it has no

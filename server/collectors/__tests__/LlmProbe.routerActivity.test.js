@@ -545,6 +545,32 @@ test("a feed read that started before a router reset cannot repopulate the clear
   assert.equal(probe._activityRun, null, "the stale run's finally() must not leave a guard behind");
 });
 
+test("a /running poll in flight across dispose() does not update router state", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  const state = { running: [EMBEDDER], prompt: 0, activity: () => jsonRes({ data: [] }) };
+  const base = pollingFetch(state).fetch;
+  let hold = false;
+  let releaseRunning;
+  probe._fetch = (url, opts) =>
+    hold && String(url).endsWith("/running")
+      ? new Promise((resolve) => (releaseRunning = () => resolve(base(url, opts))))
+      : base(url, opts);
+  await probe.probe();
+  await settle();
+  const before = { running: probe.runningModels(), events: probe.routerEvents.length };
+
+  hold = true;
+  state.running = [];
+  const pending = probe.probe().catch(() => null);
+  await settle();
+  probe.dispose();
+  releaseRunning();
+  await pending;
+  await settle();
+  assert.deepEqual(probe.runningModels(), before.running, "stale rows were not applied");
+  assert.equal(probe.routerEvents.length, before.events, "no 'stopped' event from a stale poll");
+});
+
 test("re-detecting away from llama-swap clears the router feed state", async () => {
   const probe = new LlmProbe({ isLocal: true }, 11434);
   const state = {
