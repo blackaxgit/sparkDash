@@ -6,7 +6,6 @@ import type {
   HistoryRange,
   HistoryResponse,
   HermesUpdatesResponse,
-  LlmDailyResponse,
   LlmMetrics,
   LlmHourlyResponse,
   Settings,
@@ -61,16 +60,6 @@ export function fetchSparkMetrics(id: string): Promise<{
   metrics?: { llm?: LlmMetrics[] };
 }> {
   return apiFetch(`/api/sparks/${id}/metrics`);
-}
-
-/** Daily busy tok/s rollups for one Spark LLM port. */
-export function fetchLlmDaily(
-  id: string,
-  port: number,
-  days = 14
-): Promise<LlmDailyResponse> {
-  const q = new URLSearchParams({ port: String(port), days: String(days) });
-  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/llm/daily?${q.toString()}`);
 }
 
 /** Hourly generated-token volume for one Spark LLM port. */

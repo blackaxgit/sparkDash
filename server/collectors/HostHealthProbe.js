@@ -7,10 +7,7 @@
  * the slow ones run under `timeout 5`) yields null / empty for that section only,
  * never a failed probe.
  */
-import { HOST_PATHS } from "../config.js";
-import { sshExec } from "./ssh.js";
-import fs from "fs";
-import path from "path";
+import { sshExec, execHostLocal } from "./ssh.js";
 
 const LOCAL_TIMEOUT_MS = 8000;
 const REMOTE_TIMEOUT_MS = 15000;
@@ -297,10 +294,6 @@ export class HostHealthProbe {
 
   dispose() {}
 
-  _hasHostProc() {
-    return fs.existsSync(path.join(HOST_PATHS.PROC, "1", "ns", "mnt"));
-  }
-
   /**
    * Local Docker: enter the host mount namespace (same approach as TailscaleProbe);
    * otherwise SSH.
@@ -311,18 +304,7 @@ export class HostHealthProbe {
     if (!this.spark?.isLocal) {
       return sshExec(this.spark, cmd, { timeoutMs: REMOTE_TIMEOUT_MS });
     }
-    const { execFile } = await import("child_process");
-    const useHostNs = this._hasHostProc();
-    const file = useHostNs ? "nsenter" : "sh";
-    const args = useHostNs
-      ? ["--mount=" + path.join(HOST_PATHS.PROC, "1", "ns", "mnt"), "--", "sh", "-c", cmd]
-      : ["-c", cmd];
-    return new Promise((resolve, reject) => {
-      execFile(file, args, { timeout: LOCAL_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) return reject(new Error(String(stderr || "").trim() || err.message));
-        resolve(String(stdout).trim());
-      });
-    });
+    return execHostLocal(cmd, { timeoutMs: LOCAL_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 });
   }
 
   /**
@@ -335,20 +317,8 @@ export class HostHealthProbe {
       out = await this._exec(HOST_HEALTH_SCRIPT);
     } catch (err) {
       return {
+        ...parseHostHealth("", Date.now()),
         available: false,
-        level: "ok",
-        reasons: [],
-        psi: { cpu: null, memory: null, io: null },
-        load: null,
-        swap: null,
-        nvme: null,
-        pcieAer: null,
-        xid24h: null,
-        lastXid: null,
-        failedUnits: [],
-        containers: [],
-        wifi: [],
-        updatedAt: Date.now(),
         error: err?.message || "host health probe failed",
       };
     }

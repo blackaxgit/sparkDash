@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchHistory } from "../../api/client";
 import type { HistoryRange, HistoryResponse } from "../../api/types";
 import { formatBytesPerSec } from "../../shared/formatBytes";
+import { celsiusToFahrenheit } from "../../shared/temperature";
 import { Panel } from "../ui/Panel";
 import { TrendChart, type TrendSeries } from "../ui/TrendChart";
 
@@ -12,7 +13,7 @@ const REFRESH_MS: Record<HistoryRange, number> = { "1h": 60_000, "24h": 60_000, 
 // Module-level so the chart's memoization isn't defeated by a fresh closure per render.
 const formatNet = (v: number) => formatBytesPerSec(Math.round(v));
 /** The plotted temperature is °C; labels are shown in °F. */
-const formatFahrenheit = (c: number) => String(Math.round((c * 9) / 5 + 32));
+const formatFahrenheit = (c: number) => String(celsiusToFahrenheit(c));
 const LLM_COLORS = [
   "var(--color-accent)",
   "var(--color-success)",

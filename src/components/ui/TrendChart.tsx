@@ -22,7 +22,7 @@ const AXIS_H = 16; // bottom space for x-axis labels
 const PAD_R = 6;
 const DAY_MS = 24 * 3600_000;
 
-function formatTime(ts: number, withDay: boolean): string {
+export function formatTime(ts: number, withDay: boolean): string {
   const d = new Date(ts);
   const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   return withDay ? `${d.toLocaleDateString("en-US", { weekday: "short" })} ${hm}` : hm;

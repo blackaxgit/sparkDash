@@ -36,7 +36,6 @@ import { showcaseManager } from "./collectors/ShowcaseManager.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
 import { onceClose, resolveLlmHttpTarget } from "./collectors/llmTunnel.js";
 import { formatLlmBaseUrl, parseLlmTargetInput } from "../src/shared/llmTarget.js";
-import { llmDaily } from "./collectors/LlmDaily.js";
 import {
   createLlmTokenRuntime,
   registerLlmTokenTotalsRoute,
@@ -557,7 +556,7 @@ app.post("/api/sparks/:id/video/cancel", async (req, res) => {
     if (!spark || !mon?.videoProbe) return res.status(404).json({ error: "Video studio not found" });
     const promptId = req.body?.promptId;
     const port = mon.videoProbe.studioPort();
-    const verdict = videoCancelVerdict({ promptId, studioPort: port, jobState: mon.videoProbe.hasJob(promptId) });
+    const verdict = videoCancelVerdict({ promptId, studioPort: port, jobState: mon.videoProbe.jobState(promptId) });
     if (verdict) return res.status(verdict.status).json({ error: verdict.error });
     const result = await comfyCancelJob(spark, promptId, port);
     void mon._pollDomain("video");
@@ -1054,26 +1053,6 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
-});
-
-/**
- * Daily decode / prefill tok/s rollups (busy samples, last 14 UTC days by default).
- * Query: port (required for multi-port), days (1–30).
- */
-app.get("/api/sparks/:id/llm/daily", (req, res) => {
-  const spark = registry.getSpark(req.params.id);
-  if (!spark) return res.status(404).json({ error: "Spark not found" });
-  const ports =
-    Array.isArray(spark.llmPorts) && spark.llmPorts.length
-      ? spark.llmPorts
-      : [resolveLlmPort(spark)];
-  let port = req.query.port != null ? Number(req.query.port) : ports[0];
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    return res.status(400).json({ error: "Invalid port" });
-  }
-  let days = req.query.days != null ? Number(req.query.days) : 14;
-  if (!Number.isFinite(days)) days = 14;
-  res.json(llmDaily.getSeries(spark.id, port, { days }));
 });
 
 /**
@@ -1898,11 +1877,6 @@ async function shutdown(signal) {
     );
   } catch (err) {
     console.error("[sparkDash] failed to finalize benchmarks:", err.message);
-  }
-  try {
-    llmDaily.flush();
-  } catch (err) {
-    console.error("[sparkDash] failed to flush LLM daily history:", err.message);
   }
   try {
     llmHourly.flush();

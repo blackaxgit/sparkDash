@@ -10,10 +10,13 @@
  * One sample per broadcast tick per series, capped at MAX_SAMPLES, persisted
  * to config/metrics-history.json so a container restart does not wipe it.
  *
- * KEY CONTRACT: the keys produced here MUST match the keys
+ * KEY CONTRACT (short tier): the keys produced here MUST match the keys
  * metricsStore.ingestSnapshots() pushes on the client, because hydration seeds
  * that same Map by key. Both sides derive `${sparkId}:${metric}` identically;
  * changing one without the other silently produces series nobody reads.
+ * The long tier below has its own keys (`mem.percentage`, `gpu.power`, `net.*`,
+ * ...) that ingestSnapshots() does not push; its `gpu.*` keys are gated on the
+ * snapshot's `collected` flag.
  *
  * TIMING CONTRACT: every series carries a parallel array of sample
  * timestamps, kept in lockstep with the values on push, trim and delete. It
@@ -63,7 +66,7 @@ function trimLong(entry, now) {
 }
 
 /** Per-minute figures worth charting over days, keyed without the spark prefix. */
-function longSamples(m, llmPorts) {
+function longSamples(m, llmPorts, kind) {
   const out = {};
   // A failed GPU collection reports zeros; leave the keys out so the minute is a gap.
   if (m.gpu && m.gpu.collected !== false) {
@@ -71,7 +74,9 @@ function longSamples(m, llmPorts) {
     out["gpu.temp"] = m.gpu.temperature;
     out["gpu.power"] = m.gpu.power?.draw;
   }
-  out["mem.percentage"] = m.unifiedMemory?.percentage ?? m.ram?.percentage;
+  // Unified memory counts dedicated VRAM, which is wrong on discrete-GPU hosts.
+  out["mem.percentage"] =
+    kind === "host" ? m.ram?.percentage : (m.unifiedMemory?.percentage ?? m.ram?.percentage);
   if (m.cpu) out["cpu.usage"] = m.cpu.usage;
   const net = m.network;
   if (net && Array.isArray(net.interfaces)) {
@@ -393,7 +398,7 @@ export class MetricsHistoryStore {
       alive.add(s.id);
       if (!s.online) continue; // don't record zero-samples for offline hosts
       const m = s.metrics || {};
-      for (const [k, v] of Object.entries(longSamples(m, s.llmPorts))) {
+      for (const [k, v] of Object.entries(longSamples(m, s.llmPorts, s.kind))) {
         this._accumulate(`${s.id}:${k}`, v, minute);
       }
       if (m.gpu) {

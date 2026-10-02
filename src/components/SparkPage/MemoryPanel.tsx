@@ -46,8 +46,6 @@ export function MemoryPanel({ sparkId, memory, hostHealth, className }: MemoryPa
   const swap = hostHealth?.swap ?? null;
   const mem = hostHealth?.psi?.memory ?? null;
   const full = mem?.fullAvg60 ?? null;
-  const psiClass =
-    full != null && full >= 30 ? "text-danger" : full != null && full >= 10 ? "text-warning" : "text-text";
 
   return (
     <Panel
@@ -119,7 +117,7 @@ export function MemoryPanel({ sparkId, memory, hostHealth, className }: MemoryPa
       {mem && (
         <div className="flex justify-between text-xs">
           <span className="text-muted">Memory pressure</span>
-          <span className={`font-tabular ${psiClass}`}>
+          <span className="font-tabular text-text">
             PSI some {mem.someAvg60.toFixed(1)}% · full {full == null ? "—" : `${full.toFixed(1)}%`} (60 s)
           </span>
         </div>

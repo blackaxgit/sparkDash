@@ -68,7 +68,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Non-Spark GPU hosts** | Linux boxes with a dedicated NVIDIA GPU are first-class units: same `nvidia-smi` collectors over SSH, detected hardware summary, and separate **RAM** / **VRAM** panels. Detail page: GPU (left) + **RAM → Network → Storage** (right column); Overview cards show RAM and VRAM bars |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, q27, or a llama-swap router (follows the engine that is actually loaded); live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27; **daily peak** history on the LLM card |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, q27, or a llama-swap router (follows the engine that is actually loaded); live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27 |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Hermes Agent** | Opt-in per unit: background update check (10 min), status badges, one-click or batch `hermes update` |
 | **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet |
@@ -82,7 +82,11 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Spark uptime** | System uptime displayed inline on each Spark header for at-a-glance availability |
 | **Power controls** | Graceful shutdown (SSH host script) and Wake-on-LAN; batch actions on Overview |
 | **Spark roles** | **Head** / **Worker** / **Standalone** — worker label + head link; standalone can disable LLM monitoring; optional hide workers from Overview and tabs |
-| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s), GPU/CPU split, bandwidth via `nvidia-smi dmon`. Non-Spark hosts show discrete **VRAM** (nvidia-smi) and system **RAM** separately |
+| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s): a **Memory** card with the GPU / CPU / free split, OOM risk, *free for a new model*, swap and memory pressure. Non-Spark hosts show discrete **VRAM** (nvidia-smi) and system **RAM** separately |
+| **Host health** | Once a minute: pressure stall (PSI), load, swap, NVMe SMART (temperature, wear, TB written, unsafe shutdowns, media errors), PCIe AER totals, kernel GPU `Xid` lines (24 h), failed systemd units, Docker containers and the Wi-Fi link — with warn / critical levels and an Overview alert |
+| **7-day history** | One-minute averages of GPU usage / temperature / power, memory, CPU, network and LLM tok/s, persisted for 7 days; **History** card with 1h / 24h / 7d, axes and hover values |
+| **llama-swap router** | Model swaps with cold-load times, request outcomes per hour from llama-swap's activity log (OK / rejected 429 / failed), per-engine prompt tok/s, and **Load / Unload** that refuse while a video studio is rendering |
+| **Video studios** | ComfyUI studios behind llama-swap: active render, queue (cancel / remove), recent renders, 24 h GPU-busy chart, and chat requests waiting behind the GPU lease |
 | **Themes** | Dark, light, cool white, OLED — neutral palettes, persisted in `localStorage` |
 | **Secrets** | SSH passwords AES-256-GCM encrypted; never in `sparks.json` or API responses |
 | **Docker-first** | Single privileged container for host metrics; prod and dev Compose files |
@@ -365,7 +369,6 @@ sparkDash/
 | POST | `/api/sparks/:id/llm-ports` | Add an LLM port (hot) |
 | DELETE | `/api/sparks/:id/llm-ports/:port` | Remove an LLM port (hot) |
 | PUT | `/api/sparks/:id/llm-port` | LLM port — backward-compat (hot) |
-| GET | `/api/sparks/:id/llm/daily` | Daily busy decode/prefill tok/s (`port`, `days`) |
 | POST | `/api/sparks/:id/llm/bench` | Start decode benchmark (202); poll/cancel/clear on the same path |
 | POST | `/api/sparks/:id/llm/prefill-bench` | Start prefill + TTFT context sweep (202); poll/cancel/clear on the same path |
 | GET | `/api/settings` | Global settings |

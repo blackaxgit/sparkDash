@@ -296,6 +296,18 @@ test("long tier keys follow the spec: memory fallback, primary NIC, per-port tok
   assert.equal(series["llm:11435.tps"], undefined);
 });
 
+test("long tier memory on a discrete-GPU host uses RAM, not the unified figure that counts VRAM", () => {
+  const store = new MetricsHistoryStore(tmpFile());
+  // 10 of 64 GiB RAM is ~16%; unified memory would add 24 GiB of dedicated VRAM and read 38%.
+  const host = longSnap({
+    extra: { ram: { percentage: 16 }, unifiedMemory: { percentage: 38 } },
+  }).map((s) => ({ ...s, kind: "host" }));
+  store.recordSnapshot(host, T);
+
+  const series = store.getRange("spark-1", "1h", T + 1000).series;
+  assert.equal(valueAt({ series }, "mem.percentage", T), 16);
+});
+
 test("long tier drops a removed spark's series from memory and disk", () => {
   const file = tmpFile();
   const store = new MetricsHistoryStore(file);

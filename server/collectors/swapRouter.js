@@ -271,32 +271,56 @@ export function parseRouterModels(payload) {
 }
 
 /**
+ * Sum of one Prometheus counter over all its label sets. null when the series
+ * is absent.
+ * @param {string} txt
+ * @param {string} name metric name (no regex metacharacters)
+ * @returns {number | null}
+ */
+export function sumSeries(txt, name) {
+  const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)\\s*$`, "gm");
+  let sum = 0;
+  let found = false;
+  let m;
+  while ((m = re.exec(txt)) !== null) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) {
+      sum += v;
+      found = true;
+    }
+  }
+  return found ? sum : null;
+}
+
+/**
+ * The first name in `names` that has a series, summed over its label sets.
+ * @param {string} txt
+ * @param {string[]} names in order of preference
+ * @returns {number | null}
+ */
+export function firstSeriesSum(txt, names) {
+  for (const name of names) {
+    const sum = sumSeries(txt, name);
+    if (sum !== null) return sum;
+  }
+  return null;
+}
+
+const PROMPT_TOKEN_SERIES = [
+  "vllm:prompt_tokens_total",
+  "sglang:prompt_tokens_total",
+  "sglang_prompt_tokens_total",
+  "llamacpp:prompt_tokens_total",
+];
+
+/**
  * Cumulative prompt (prefill) tokens from a Prometheus body, summed over all
  * label sets. null when no known series is present.
  * @param {string} txt
  * @returns {number | null}
  */
 export function promptTokensFromMetrics(txt) {
-  for (const name of [
-    "vllm:prompt_tokens_total",
-    "sglang:prompt_tokens_total",
-    "sglang_prompt_tokens_total",
-    "llamacpp:prompt_tokens_total",
-  ]) {
-    const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)\\s*$`, "gm");
-    let sum = 0;
-    let found = false;
-    let m;
-    while ((m = re.exec(txt)) !== null) {
-      const v = parseFloat(m[1]);
-      if (Number.isFinite(v)) {
-        sum += v;
-        found = true;
-      }
-    }
-    if (found) return sum;
-  }
-  return null;
+  return firstSeriesSum(txt, PROMPT_TOKEN_SERIES);
 }
 
 /**
@@ -366,12 +390,12 @@ export function routerActionVerdict({ action, model, runningModels, studio, rout
   }
   const running = runningModels.includes(model);
   const resident = residentStudio(runningModels, studio, video);
-  const queue = resident ? studioQueue(resident, video) : null;
-  const unknown = () => ({ status: 409, error: `GPU held by video studio ${resident?.name} (state unknown)` });
+  const unknown = () => ({ status: 409, error: `GPU held by video studio ${resident.name} (state unknown)` });
 
   if (action === "unload") {
     if (!running) return { status: 409, error: `${model} is not running` };
-    if (resident?.model === model && queue) {
+    if (resident?.model === model) {
+      const queue = studioQueue(resident, video);
       if (queue.kind === "unknown") return unknown();
       if (queue.kind === "busy") {
         return {
@@ -390,7 +414,8 @@ export function routerActionVerdict({ action, model, runningModels, studio, rout
     return { status: 409, error: `${model} is already loaded` };
   }
   if (running) return { status: 409, error: `${model} is already running or loading` };
-  if (resident && queue) {
+  if (resident) {
+    const queue = studioQueue(resident, video);
     if (queue.kind === "unknown") return unknown();
     if (queue.kind === "busy") {
       return {

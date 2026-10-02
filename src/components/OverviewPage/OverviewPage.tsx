@@ -9,6 +9,7 @@ import { FleetAlertStrip } from "./FleetAlertStrip";
 import { FleetTokenTotals } from "./FleetTokenTotals";
 import { ActivityIcon, PowerOffIcon, PowerOnIcon, RotateIcon } from "../ui/icons";
 import { formatMb } from "../../shared/formatBytes";
+import { celsiusToFahrenheit, tempFormatter } from "../../shared/temperature";
 import { Sparkline } from "../ui/Sparkline";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 
@@ -24,17 +25,6 @@ interface OverviewPageProps {
   temperatureUnit?: "celsius" | "fahrenheit";
   onSelectSpark?: (id: string) => void;
 }
-
-function celsiusToFahrenheit(c: number): number {
-  return Math.round(c * 9 / 5 + 32);
-}
-
-/** Tooltip formatter for °C-valued history, shown in the user's unit. */
-function tempFormatter(unit: "celsius" | "fahrenheit"): (c: number) => string {
-  return (c) => (unit === "fahrenheit" ? `${celsiusToFahrenheit(c)}°F` : `${Number(c.toFixed(1))}°C`);
-}
-
-
 
 /** Format a storage value in MB, stripping trailing ".0" and optionally omitting the unit. */
 function fmtStorage(mb: number, unit: boolean): string {

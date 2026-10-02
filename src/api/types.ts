@@ -548,25 +548,6 @@ export interface LlmMetrics {
   error: string | null;
 }
 
-/** One UTC day of busy tok/s rollups (null avg = no busy samples). */
-export interface LlmDailyDay {
-  date: string;
-  decodeMax: number;
-  decodeAvg: number | null;
-  prefillMax: number;
-  prefillAvg: number | null;
-  cachedPrefillMax: number | null;
-  cachedPrefillAvg: number | null;
-  uncachedPrefillMax: number | null;
-  uncachedPrefillAvg: number | null;
-}
-
-export interface LlmDailyResponse {
-  sparkId: string;
-  port: number;
-  days: LlmDailyDay[];
-}
-
 /** One UTC hour of generated-token volume. `hour` is "YYYY-MM-DDTHH". */
 export interface LlmHourlyBucket {
   hour: string;

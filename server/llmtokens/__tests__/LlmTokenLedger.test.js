@@ -18,8 +18,8 @@ function tmpLedger() {
   return new LlmTokenLedger(path.join(dir, "llm-token-totals.json"));
 }
 
-function obs(sparkId, port, modelId, output, prompt, cached) {
-  return { sparkId, port, modelId, output, prompt, cached: cached ?? null };
+function obs(sparkId, port, modelId, output, prompt, cached, engineId) {
+  return { sparkId, port, modelId, engineId: engineId ?? null, output, prompt, cached: cached ?? null };
 }
 
 test("extractTokenObservations: aligns metrics.llm with llmPorts and skips invalid rows", () => {
@@ -44,6 +44,7 @@ test("extractTokenObservations: aligns metrics.llm with llmPorts and skips inval
     sparkId: "spark-a",
     port: 8888,
     modelId: "org/model-a",
+    engineId: null,
     output: 100,
     prompt: 500,
     cached: null,
@@ -52,6 +53,7 @@ test("extractTokenObservations: aligns metrics.llm with llmPorts and skips inval
     sparkId: "spark-b",
     port: 8888,
     modelId: null,
+    engineId: null,
     output: 7,
     prompt: null,
     cached: null,
@@ -146,6 +148,24 @@ test("LlmTokenLedger: counter reset (engine restart) re-seeds without crediting"
   // Only post-restart delta (20) credited; pre-restart total (100) survives.
   assert.equal(s.models[0].completionTokens, 120);
   assert.equal(s.models[0].promptTokens, 1020);
+});
+
+test("LlmTokenLedger: an engine switch re-seeds instead of crediting the new engine's lifetime counter", () => {
+  const ledger = tmpLedger();
+  const t0 = 1_730_000_000_000;
+  ledger.record([obs("spark-a", 8080, "org/a", 100, 1000, null, "org/a@1")], t0);
+  // Router swapped to engine B, whose own lifetime counter is far higher.
+  ledger.record([obs("spark-a", 8080, "org/b", 1000, 9000, null, "org/b@2")], t0 + 5_000);
+  let s = ledger.snapshot().series[0];
+  assert.equal(s.models.length, 0, "nothing credited across the engine boundary");
+
+  // Growth within the same engine is still credited to the model that served it.
+  ledger.record([obs("spark-a", 8080, "org/b", 1040, 9100, null, "org/b@2")], t0 + 10_000);
+  s = ledger.snapshot().series[0];
+  assert.equal(s.models.length, 1);
+  assert.equal(s.models[0].modelId, "org/b");
+  assert.equal(s.models[0].completionTokens, 40);
+  assert.equal(s.models[0].promptTokens, 100);
 });
 
 test("LlmTokenLedger: daily buckets credit deltas and serve ranged snapshots", () => {

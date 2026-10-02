@@ -625,16 +625,16 @@ test("probe: history is refetched only every 30 s or when the running prompt cha
   probe.dispose();
 });
 
-test("hasJob: running, pending and unknown prompts", async () => {
+test("jobState: running, pending and unknown prompts", async () => {
   const { probe } = newProbe({ running: RUNNING_WITH_STUDIO });
-  assert.equal(probe.hasJob("run-1"), null, "nothing known before the first poll");
+  assert.equal(probe.jobState("run-1"), null, "nothing known before the first poll");
   await probe.probe();
-  assert.equal(probe.hasJob("run-1"), "running");
-  assert.equal(probe.hasJob("pend-1"), "pending");
-  assert.equal(probe.hasJob("pend-2"), "pending");
-  assert.equal(probe.hasJob("newOk"), null, "a finished job is not in the queue");
-  assert.equal(probe.hasJob(""), null);
-  assert.equal(probe.hasJob(undefined), null);
+  assert.equal(probe.jobState("run-1"), "running");
+  assert.equal(probe.jobState("pend-1"), "pending");
+  assert.equal(probe.jobState("pend-2"), "pending");
+  assert.equal(probe.jobState("newOk"), null, "a finished job is not in the queue");
+  assert.equal(probe.jobState(""), null);
+  assert.equal(probe.jobState(undefined), null);
   probe.dispose();
 });
 
@@ -654,7 +654,7 @@ test("studioPort: set while the studio is ready, null once it leaves /running", 
   now = T + 3000;
   await probe.probe();
   assert.equal(probe.studioPort(), null);
-  assert.equal(probe.hasJob("run-1"), null, "live queue is dropped with the studio");
+  assert.equal(probe.jobState("run-1"), null, "live queue is dropped with the studio");
   probe.dispose();
 });
 

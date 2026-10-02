@@ -479,3 +479,91 @@ test("routerLoad: GET /upstream/{model}/health, one load in flight, flag cleared
     console.log = log;
   }
 });
+
+test("dispose: aborts the pending model load and refuses new ones", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  let signal;
+  probe._fetch = (url, opts) => {
+    signal = opts.signal;
+    return new Promise((resolve, reject) => {
+      opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  };
+  const log = console.log;
+  console.log = () => {};
+  try {
+    assert.deepEqual(probe.routerLoad("ornith-35b"), { started: true });
+    assert.equal(signal.aborted, false);
+    assert.equal(probe.isLoadInFlight(), true);
+
+    probe.dispose();
+    assert.equal(signal.aborted, true, "the 20-minute request does not outlive the probe");
+    await new Promise((r) => setImmediate(r));
+    assert.equal(probe.isLoadInFlight(), false);
+    assert.deepEqual(probe.routerLoad("other"), { started: false, reason: "disposed" });
+  } finally {
+    console.log = log;
+  }
+});
+
+test("dispose: a feed read that finishes afterwards does not update the probe", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  let release;
+  const state = {
+    running: [EMBEDDER],
+    prompt: 0,
+    activity: () => new Promise((resolve) => (release = () => resolve(jsonRes({ data: [] })))),
+  };
+  probe._fetch = pollingFetch(state).fetch;
+  await probe.probe();
+  await settle();
+  probe.dispose();
+  release();
+  await settle();
+  assert.equal(probe.routerActivity, null);
+});
+
+test("re-detecting away from llama-swap clears the router feed state", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  const state = {
+    running: [EMBEDDER],
+    prompt: 0,
+    activity: () => jsonRes({ data: [{ timestamp: new Date().toISOString(), model: "m", resp_status_code: 429, error_msg: "full" }] }),
+  };
+  probe._fetch = pollingFetch(state).fetch;
+  await probe.probe();
+  await settle();
+  state.running = [];
+  const snap = await probe.probe();
+  assert.equal(snap.router, "llama-swap");
+  assert.equal(snap.routerEvents.length, 1);
+  assert.ok(snap.routerActivity);
+  assert.equal(snap.routerModels.length, 1);
+
+  probe._resetDetection();
+  assert.equal(probe.routerEvents.length, 0);
+  assert.equal(probe.routerActivity, null);
+  assert.deepEqual(probe.routerModels, []);
+  assert.equal(probe._routerRows, null);
+  assert.equal(probe._routerPrev, null);
+  assert.equal(probe._activityNextAt, 0);
+  assert.equal(probe._modelsNextAt, 0);
+  assert.equal(probe._activityRun, null);
+  assert.equal(probe._modelsRun, null);
+  assert.deepEqual(probe._feedHealth, {
+    activity: { fails: 0, failing: false },
+    models: { fails: 0, failing: false },
+  });
+});
+
+test("a snapshot only carries router feeds while the server is a llama-swap router", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  probe.routerEvents = [{ at: 1, model: "m", state: "ready", loadMs: null }];
+  probe.routerActivity = { updatedAt: 1 };
+  probe.routerModels = [{ id: "m", name: null, loaded: true }];
+  probe.router = null;
+  const snap = probe._getSnapshot();
+  assert.deepEqual(snap.routerEvents, []);
+  assert.equal(snap.routerActivity, null);
+  assert.deepEqual(snap.routerModels, []);
+});

@@ -10,7 +10,7 @@
  * `GET /api/events` (SSE, read once then aborted). Studio traffic goes straight to the
  * upstream origin from /running (`upstreamBase`), never through llama-swap's
  * /upstream/<model>/ path. This probe never POSTs anything: cancelling or removing a job
- * goes through comfyActions from the server route, guarded by studioPort() / hasJob().
+ * goes through comfyActions from the server route, guarded by studioPort() / jobState().
  * Request headers and remote IPs from /api/events are never read into the snapshot.
  *
  * Progress is an ESTIMATE: ComfyUI only sends step progress to the submitting client_id, so
@@ -468,7 +468,7 @@ export class VideoStudioProbe {
    * @param {string} promptId
    * @returns {"running" | "pending" | null}
    */
-  hasJob(promptId) {
+  jobState(promptId) {
     if (typeof promptId !== "string" || !promptId) return null;
     if (this._active?.promptId === promptId) return "running";
     if (this._pending.some((p) => p.promptId === promptId)) return "pending";

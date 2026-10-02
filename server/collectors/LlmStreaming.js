@@ -10,6 +10,7 @@ import {
   upstreamBase,
   processStartTime,
   pickNewestEngine,
+  firstSeriesSum,
 } from "./swapRouter.js";
 
 import { Agent, fetch as undiciFetch } from "undici";
@@ -124,30 +125,17 @@ export function sleep(ms, signal) {
  * @returns {number | null}
  */
 export function generationTokensFromMetrics(txt) {
-  const fromSeries = (re) => {
-    let sum = 0;
-    let found = false;
-    let m;
-    while ((m = re.exec(txt)) !== null) {
-      const v = parseFloat(m[1]);
-      if (Number.isFinite(v)) {
-        sum += v;
-        found = true;
-      }
-    }
-    return found ? sum : null;
-  };
-  return (
-    fromSeries(/^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
-    fromSeries(/^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
-    fromSeries(/^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
-    fromSeries(/^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+  return firstSeriesSum(txt, [
+    "ds4_tokens_decoded_total",
+    "vllm:generation_tokens_total",
+    "sglang:generation_tokens_total",
+    "sglang_generation_tokens_total",
     // q27 (signalnine/q27 engine) — live processed counter first, then the
     // completion-based per-api total (same preference as LlmProbe).
-    fromSeries(/^q27_decode_tokens_processed_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
-    fromSeries(/^q27_decode_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
-    fromSeries(/^llamacpp:tokens_predicted_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm)
-  );
+    "q27_decode_tokens_processed_total",
+    "q27_decode_tokens_total",
+    "llamacpp:tokens_predicted_total",
+  ]);
 }
 
 /**

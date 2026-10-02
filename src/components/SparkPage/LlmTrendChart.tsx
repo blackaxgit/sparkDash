@@ -6,12 +6,11 @@ const VIEW_W = 300;
 const VIEW_H = 64;
 const PAD = 2;
 /**
- * Fixed display window: 30 minutes of 2 s samples. The x-axis is anchored to
- * this constant — never the current sample count — so the line grows into the
- * chart left-to-right and then scrolls, instead of re-stretching (rewriting
- * history) on every tick. Averages below still span full HISTORY_MAX retention.
+ * Fixed display window: 30 minutes. The x-axis is anchored to this constant —
+ * never the current sample count — so the line grows into the chart
+ * left-to-right and then scrolls, instead of re-stretching (rewriting history)
+ * on every tick. Averages below still span full HISTORY_MAX retention.
  */
-const DISPLAY_WINDOW = 900;
 export const DISPLAY_WINDOW_MS = 30 * 60 * 1000;
 
 function fmt(n: number | null): string {
@@ -62,11 +61,6 @@ function historyLabel(): string {
   return `last 30m · averages since page opened (up to ${fmtSpan(HISTORY_MAX * 2)})`;
 }
 
-/** Newest DISPLAY_WINDOW samples — the slice the chart draws. */
-function windowed(data: readonly number[]): readonly number[] {
-  return data.length > DISPLAY_WINDOW ? data.slice(-DISPLAY_WINDOW) : data;
-}
-
 /**
  * tok/s trend chart for one LLM port. The x-axis is a FIXED 30-minute window:
  * the line grows left-to-right while filling, then scrolls — history already
@@ -96,17 +90,18 @@ export function LlmTrendChart({
   const prefillAvg = useMemo(() => avgPositive(prefill), [prefill]);
   const ttftAvg = useMemo(() => avgPositive(ttft), [ttft]);
 
-  // Chart draws only the newest hour; averages above use the full series.
-  const genWin = useMemo(() => windowed(gen), [gen]);
-  const prefillWin = useMemo(() => windowed(prefill), [prefill]);
+  // Max and points share one window (the last DISPLAY_WINDOW_MS), so every
+  // drawn sample is also counted when scaling; averages above use the full series.
+  const genWin = useMemo(() => windowSamples(genTimed), [genTimed]);
+  const prefillWin = useMemo(() => windowSamples(prefillTimed), [prefillTimed]);
 
   // Normalise each series to its OWN max: prefill (thousands) and generation
   // (tens) differ by ~100x, so a shared scale would flatten gen into the floor.
   // Max is over the drawn window so old spikes can't squash recent detail.
-  const genMax = useMemo(() => Math.max(1, ...genWin), [genWin]);
-  const prefillMax = useMemo(() => Math.max(1, ...prefillWin), [prefillWin]);
-  const genPts = useMemo(() => buildSegments(genTimed.filter((s) => s.at >= (genTimed.at(-1)?.at ?? 0) - DISPLAY_WINDOW_MS), genMax), [genTimed, genMax]);
-  const prefillPts = useMemo(() => buildSegments(prefillTimed.filter((s) => s.at >= (prefillTimed.at(-1)?.at ?? 0) - DISPLAY_WINDOW_MS), prefillMax), [prefillTimed, prefillMax]);
+  const genMax = useMemo(() => Math.max(1, ...genWin.map((s) => s.value)), [genWin]);
+  const prefillMax = useMemo(() => Math.max(1, ...prefillWin.map((s) => s.value)), [prefillWin]);
+  const genPts = useMemo(() => buildSegments(genWin, genMax), [genWin, genMax]);
+  const prefillPts = useMemo(() => buildSegments(prefillWin, prefillMax), [prefillWin, prefillMax]);
 
   const hasData = genWin.length > 1 || prefillWin.length > 1;
 

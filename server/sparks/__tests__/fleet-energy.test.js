@@ -1022,6 +1022,22 @@ test("token observation gaps over 10 seconds and source changes rebase", () => {
   assert.equal(tracker.snapshot(16_001).outputTokens24h, 20);
 });
 
+test("a token source change of engine rebases; growth within one engine is credited", () => {
+  const tracker = new FleetEnergyTracker(noTimerOptions());
+  const withEngine = (tokens, engineId) => {
+    const snapshots = fleetSnapshots(100, { outputTokens: tokens });
+    snapshots[0].metrics.llm[0].engineId = engineId;
+    return snapshots;
+  };
+  tracker.record(withEngine(100, "a@1"), 0);
+  tracker.record(withEngine(110, "a@1"), 2_000);
+  // Router swapped engines; B's lifetime counter is higher but none of it is new work.
+  tracker.record(withEngine(5_000, "b@2"), 4_000);
+  assert.equal(tracker.snapshot(4_000).outputTokens24h, 10);
+  tracker.record(withEngine(5_025, "b@2"), 6_000);
+  assert.equal(tracker.snapshot(6_000).outputTokens24h, 35);
+});
+
 test("token source requires exactly one canonical head and ignores noncanonical heads", () => {
   const tracker = new FleetEnergyTracker(noTimerOptions());
   const withIntruder = fleetSnapshots(100, { outputTokens: 100 });
@@ -1193,6 +1209,7 @@ test("persistence reload preserves aggregates, token baseline, and does not back
   assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")).tokenCounter, {
     headId: "node-a",
     port: 8000,
+    engineId: null,
     totalOutputTokens: 150,
     observedAtMs: now + 2_000,
   });

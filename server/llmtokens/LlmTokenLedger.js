@@ -80,7 +80,7 @@ function finiteCount(v) {
  * older probe without totalPromptTokens support is fine — only the output
  * counter is mandatory) are skipped.
  * @param {Array<unknown>} snapshots
- * @returns {Array<{ sparkId: string, port: number, modelId: string|null, output: number, prompt: number|null, cached: number|null }>}
+ * @returns {Array<{ sparkId: string, port: number, modelId: string|null, engineId: string|null, output: number, prompt: number|null, cached: number|null }>}
  */
 export function extractTokenObservations(snapshots) {
   const rows = [];
@@ -103,7 +103,8 @@ export function extractTokenObservations(snapshots) {
       const cached = entry.totalCachedTokens == null ? null : finiteCount(entry.totalCachedTokens);
       const rawModel = typeof entry.modelId === "string" ? entry.modelId.trim() : "";
       const modelId = rawModel ? rawModel.slice(0, MODEL_ID_MAX_LEN) : null;
-      rows.push({ sparkId, port, modelId, output, prompt, cached });
+      const engineId = typeof entry.engineId === "string" && entry.engineId ? entry.engineId : null;
+      rows.push({ sparkId, port, modelId, engineId, output, prompt, cached });
     }
   }
   return rows;
@@ -166,6 +167,7 @@ export class LlmTokenLedger {
           output: finiteCount(value.counters?.output),
           prompt: value.counters?.prompt == null ? null : finiteCount(value.counters.prompt),
           cached: value.counters?.cached == null ? null : finiteCount(value.counters.cached),
+          engineId: typeof value.counters?.engineId === "string" ? value.counters.engineId : null,
         },
         models,
       };
@@ -222,7 +224,7 @@ export class LlmTokenLedger {
 
   /**
    * Credit deltas from one batch of observations. Returns true when state changed.
-   * @param {Array<{ sparkId: string, port: number, modelId: string|null, output: number, prompt: number|null }>} observations
+   * @param {Array<{ sparkId: string, port: number, modelId: string|null, engineId?: string|null, output: number, prompt: number|null }>} observations
    * @param {number} [now]
    */
   record(observations, now = Date.now()) {
@@ -234,7 +236,7 @@ export class LlmTokenLedger {
         series = {
           updatedAt: 0,
           lastModelId: null,
-          counters: { output: null, prompt: null, cached: null },
+          counters: { output: null, prompt: null, cached: null, engineId: null },
           models: {},
         };
         this._data.series[key] = series;
@@ -258,11 +260,16 @@ export class LlmTokenLedger {
         }
       }
 
-      // First observation after start/reload only seeds the baseline.
-      if (series.counters.output == null) {
+      // First observation after start/reload only seeds the baseline. So does a
+      // new engine identity: behind a router the followed engine changes, each
+      // engine has its own lifetime counters, and diffing across them would
+      // credit the new engine with tokens it never generated.
+      const engineId = obs.engineId ?? null;
+      if (series.counters.output == null || (series.counters.engineId ?? null) !== engineId) {
         series.counters.output = obs.output;
         series.counters.prompt = obs.prompt;
         series.counters.cached = obs.cached;
+        series.counters.engineId = engineId;
         series.updatedAt = now;
         changed = true;
         continue;
@@ -365,8 +372,8 @@ export class LlmTokenLedger {
   /**
    * Read-only public shape for GET /api/llm-token-totals.
    * `range`: "all" (lifetime) or a daily-bucket window (today / 7d / 14d / 30d).
-   * Ranged rows aggregate the retained UTC-day buckets; day boundaries are UTC,
-   * matching the LlmDaily convention. `lastSeenAt` is null for ranged rows.
+   * Ranged rows aggregate the retained UTC-day buckets; day boundaries are UTC.
+   * `lastSeenAt` is null for ranged rows.
    * @param {string} [range]
    * @param {number} [nowMs]
    */

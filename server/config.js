@@ -15,9 +15,6 @@ const SPARKS_SECRETS_PATH =
 /** AES key file (auto-generated if SPARKDASH_SECRETS_KEY unset). */
 const SECRETS_KEY_PATH =
   process.env.SECRETS_KEY_PATH || path.join(ROOT, "config", ".secrets-key");
-/** Daily LLM tok/s rollups (gitignored). */
-const LLM_DAILY_JSON_PATH =
-  process.env.LLM_DAILY_JSON_PATH || path.join(ROOT, "config", "llm-daily.json");
 /** Cumulative LLM token totals per model (gitignored). */
 const LLM_TOKEN_JSON_PATH =
   process.env.LLM_TOKEN_JSON_PATH || path.join(ROOT, "config", "llm-token-totals.json");
@@ -113,7 +110,6 @@ export {
   GPU_MEMORY_JSON_PATH,
   SPARKS_SECRETS_PATH,
   SECRETS_KEY_PATH,
-  LLM_DAILY_JSON_PATH,
   LLM_TOKEN_JSON_PATH,
   FLEET_ENERGY_JSON_PATH,
   LLM_HOURLY_JSON_PATH,

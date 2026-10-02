@@ -152,6 +152,10 @@ export class LlmProbe {
     this._feedHealth = { activity: { fails: 0, failing: false }, models: { fails: 0, failing: false } };
     /** True while a fire-and-forget model load is outstanding. */
     this._routerLoadInFlight = false;
+    /** Aborts the outstanding model load; null when none is in flight. */
+    this._routerLoadAbort = null;
+    /** Set by dispose(): the monitor is gone, so background work must not touch state. */
+    this._disposed = false;
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
     this.stepId = 0;
@@ -352,8 +356,23 @@ export class LlmProbe {
     this._sglangStickyTps = null;
     this.router = null;
     this.studio = null;
+    this._clearRouter();
     // Owns modelId / modelPath / contextLength, every tile and every series.
     this._clearEngine();
+  }
+
+  /** Forget the llama-swap feed state. It belongs to the router that was detected, not to the host. */
+  _clearRouter() {
+    this._routerRows = null;
+    this._routerPrev = null;
+    this.routerEvents = [];
+    this.routerActivity = null;
+    this.routerModels = [];
+    this._activityNextAt = 0;
+    this._modelsNextAt = 0;
+    this._activityRun = null;
+    this._modelsRun = null;
+    this._feedHealth = { activity: { fails: 0, failing: false }, models: { fails: 0, failing: false } };
   }
 
   /**
@@ -1058,13 +1077,16 @@ export class LlmProbe {
         }
         failure = `HTTP ${res.status}`;
       } else {
-        const activity = buildRouterActivity(await readJsonCapped(res, ACTIVITY_MAX_BYTES), now);
+        const body = await readJsonCapped(res, ACTIVITY_MAX_BYTES);
+        if (this._disposed) return;
+        const activity = buildRouterActivity(body, now);
         if (activity) this.routerActivity = activity;
         else failure = "unexpected payload";
       }
     } catch (err) {
       failure = err?.message || String(err);
     }
+    if (this._disposed) return;
     const backoff = this._noteRouterFeed("activity", failure, path);
     if (backoff) this._activityNextAt = now + backoff;
   }
@@ -1081,13 +1103,16 @@ export class LlmProbe {
         await res.body?.cancel().catch(() => {});
         failure = `HTTP ${res.status}`;
       } else {
-        const models = parseRouterModels(await readJsonCapped(res, MODELS_MAX_BYTES));
+        const body = await readJsonCapped(res, MODELS_MAX_BYTES);
+        if (this._disposed) return;
+        const models = parseRouterModels(body);
         if (models) this.routerModels = models;
         else failure = "unexpected payload";
       }
     } catch (err) {
       failure = err?.message || String(err);
     }
+    if (this._disposed) return;
     const backoff = this._noteRouterFeed("models", failure, path);
     if (backoff) this._modelsNextAt = now + backoff;
   }
@@ -1131,18 +1156,21 @@ export class LlmProbe {
    * Ask llama-swap to load one model by requesting its health endpoint, which
    * blocks until the model is up. Fire-and-forget; one load in flight per probe.
    * @param {string} model
-   * @returns {{started: true} | {started: false, reason: "busy" | "invalid"}}
+   * @returns {{started: true} | {started: false, reason: "busy" | "invalid" | "disposed"}}
    */
   routerLoad(model) {
     if (!isSafePathId(model)) return { started: false, reason: "invalid" };
+    if (this._disposed) return { started: false, reason: "disposed" };
     if (this._routerLoadInFlight) return { started: false, reason: "busy" };
     this._routerLoadInFlight = true;
+    const abort = new AbortController();
+    this._routerLoadAbort = abort;
     const t0 = Date.now();
     void (async () => {
       try {
         const res = await this._fetch(
           `${this.baseUrl}/upstream/${encodeURIComponent(model)}/health`,
-          { timeoutMs: ROUTER_LOAD_TIMEOUT_MS, longLived: true }
+          { timeoutMs: ROUTER_LOAD_TIMEOUT_MS, longLived: true, signal: abort.signal }
         );
         await res.body?.cancel().catch(() => {});
         console.log(`[LlmProbe] router load ${model} on :${this.port} -> HTTP ${res.status} after ${Date.now() - t0} ms`);
@@ -1150,10 +1178,18 @@ export class LlmProbe {
         console.log(`[LlmProbe] router load ${model} on :${this.port} failed after ${Date.now() - t0} ms: ${err?.message || err}`);
       } finally {
         this._routerLoadInFlight = false;
-        this._modelsNextAt = 0;
+        if (this._routerLoadAbort === abort) this._routerLoadAbort = null;
+        if (!this._disposed) this._modelsNextAt = 0;
       }
     })();
     return { started: true };
+  }
+
+  /** Stop all background activity for this probe: abort an in-flight model load and freeze the router feeds. */
+  dispose() {
+    this._disposed = true;
+    this._routerLoadAbort?.abort();
+    this._routerLoadAbort = null;
   }
 
   /**
@@ -2465,9 +2501,9 @@ export class LlmProbe {
       engineId: this.engineId,
       routerResident: this.routerResident,
       routerEngines: this._routerEngines(),
-      routerEvents: this.routerEvents,
-      routerActivity: this.routerActivity,
-      routerModels: this.routerModels,
+      routerEvents: this.router === "llama-swap" ? this.routerEvents : [],
+      routerActivity: this.router === "llama-swap" ? this.routerActivity : null,
+      routerModels: this.router === "llama-swap" ? this.routerModels : [],
       posture: this._buildPosture(),
       error: this.error,
     };
@@ -2539,21 +2575,23 @@ export class LlmProbe {
 
   /**
    * @param {string} url
-   * @param {{ authenticated?: boolean, method?: string, timeoutMs?: number, longLived?: boolean }} [opts]
+   * @param {{ authenticated?: boolean, method?: string, timeoutMs?: number, longLived?: boolean, signal?: AbortSignal }} [opts]
    *   `authenticated: false` sends no credentials (probing an upstream origin the
    *   router merely names). `longLived` lifts undici's 300 s header/body idle cut
-   *   for a request that is expected to block (a model load).
+   *   for a request that is expected to block (a model load). `signal` aborts the
+   *   request in addition to the timeout.
    */
   async _fetch(
     url,
-    { authenticated = true, method = "GET", timeoutMs = LLM_PROBE_TIMEOUT_MS, longLived = false } = {}
+    { authenticated = true, method = "GET", timeoutMs = LLM_PROBE_TIMEOUT_MS, longLived = false, signal = null } = {}
   ) {
     const headers = {};
     const apiKey = authenticated ? this._apiKey() : null;
     if (apiKey && this._sameHostAsProbe(url)) headers.Authorization = `Bearer ${apiKey}`;
     // A 3xx is a failure, never followed: a redirect would carry the probe (and
     // its credentials) to a host the operator did not approve.
-    const init = { method, signal: AbortSignal.timeout(timeoutMs), headers, redirect: "manual" };
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const init = { method, signal: signal ? AbortSignal.any([timeout, signal]) : timeout, headers, redirect: "manual" };
     // undici's own fetch must be paired with its own Agent (see LLM_STREAM_AGENT).
     const res = longLived
       ? await undiciFetch(url, { ...init, dispatcher: LLM_STREAM_AGENT })

@@ -12,7 +12,6 @@ import {
 } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { PrefillBenchDialog } from "./PrefillBenchDialog";
-import { LlmDailyChart } from "./LlmDailyChart";
 import { LlmHourlyChart } from "./LlmHourlyChart";
 import { LlmTokenTotals } from "./LlmTokenTotals";
 import { parseLlmTargetInput } from "../../shared/llmTarget.js";
@@ -758,7 +757,6 @@ export function LlmPanel({
             onRemotePrefill={openRemotePrefill}
           />
           {llm && <RouterPanel sparkId={sparkId} llmPort={llmPort} llm={llm} />}
-          <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
@@ -882,7 +880,6 @@ export function LlmPanel({
           )}
 
           <LlmTrendChart sparkId={sparkId} llmPort={llmPort} />
-          <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
 
           {/*

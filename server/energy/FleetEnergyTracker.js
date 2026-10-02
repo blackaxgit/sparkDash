@@ -123,6 +123,7 @@ function tokenObservation(snapshots, atMs, nodeIdSet) {
   return {
     headId: head.id,
     port,
+    engineId: typeof entry.engineId === "string" && entry.engineId ? entry.engineId : null,
     totalOutputTokens: entry.totalOutputTokens,
     observedAtMs: atMs,
   };
@@ -131,7 +132,8 @@ function tokenObservation(snapshots, atMs, nodeIdSet) {
 function sameTokenSource(left, right) {
   return (
     left?.headId === right?.headId &&
-    left?.port === right?.port
+    left?.port === right?.port &&
+    (left?.engineId ?? null) === (right?.engineId ?? null)
   );
 }
 
@@ -759,6 +761,7 @@ export class FleetEnergyTracker {
         this._tokenCounter = {
           headId: tokenCounter.headId,
           port: tokenCounter.port,
+          engineId: typeof tokenCounter.engineId === "string" ? tokenCounter.engineId : null,
           totalOutputTokens: tokenCounter.totalOutputTokens,
           observedAtMs: tokenCounter.observedAtMs,
         };

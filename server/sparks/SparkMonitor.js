@@ -10,7 +10,6 @@ import { VideoStudioProbe } from "../collectors/VideoStudioProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
 import { HostHealthProbe } from "../collectors/HostHealthProbe.js";
-import { llmDaily } from "../collectors/LlmDaily.js";
 import { llmHourly } from "../collectors/LlmHourly.js";
 import { sshExec } from "../collectors/ssh.js";
 import {
@@ -187,6 +186,9 @@ export class SparkMonitor {
       } else {
         this.llmProbes.set(port, new LlmProbe(spark, port));
       }
+    }
+    for (const [port, stale] of prevProbes) {
+      if (this.llmProbes.get(port) !== stale) stale.dispose?.();
     }
     if (!this._llmMonitoringEnabled()) {
       this._metrics.llm = [];
@@ -494,6 +496,7 @@ export class SparkMonitor {
         /* ignore */
       }
     }
+    for (const probe of this.llmProbes.values()) probe.dispose?.();
     this.hostHealthProbe.dispose();
     console.log(`[SparkMonitor] ${this.spark.id} stopped`);
   }
@@ -741,7 +744,6 @@ export class SparkMonitor {
             for (let i = 0; i < result.length; i++) {
               const probe = probes[i];
               if (probe) {
-                llmDaily.record(this.spark.id, probe.port, result[i]);
                 llmHourly.record(this.spark.id, probe.port, result[i]);
               }
             }

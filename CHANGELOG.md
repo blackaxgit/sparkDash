@@ -24,6 +24,11 @@ Format: version sections are listed newest first.
 - **Remote disks reported 0 B/s read/write** — the remote path never measured I/O. Speeds are `null` there and the Storage card shows `—`.
 - **Offline hosts logged an error every poll** — domain polls pause while a host is confirmed offline and resume when liveness returns; the Overview alert strip shows only *Host unreachable* for it.
 - **"Poll interval" did not change collection** — it sets the broadcast/history tick only; renamed *Refresh interval* with a hint.
+- **Token totals and fleet energy credited a llama-swap engine switch** — each engine behind a router has its own lifetime counters, so following a different engine booked the counter gap as generated tokens. Both re-baseline when `engineId` changes.
+- **LLM tok/s history scaled to a different window than it drew** — a spike older than the last 900 samples but inside the 30-minute view was clipped; scale and points now use the same window.
+
+### Removed
+- **Daily peak tok/s chart** — removed on the LLM card (server rollup, `GET /llm/daily`, client chart); the 30-minute trend, the hourly token chart and the 7-day history cover it.
 
 ### Added
 - **Router state on the LLM card** — a `llama-swap` chip beside the backend badge, `loading <model>…` while an engine cold-starts (Spark cold starts run 3–10 min), and a **Resident** tile with the number of models holding memory, replacing a Slots tile that vLLM can never populate.

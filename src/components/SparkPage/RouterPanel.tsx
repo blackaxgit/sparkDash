@@ -2,18 +2,11 @@ import { useState } from "react";
 import type { LlmMetrics, LlmRouterEvent } from "../../api/types";
 import { routerLoad } from "../../api/client";
 import { formatDuration } from "../../shared/formatDuration";
+import { formatTime } from "../ui/TrendChart";
 
 const SECTION = "space-y-1 border-t border-border pt-3";
 const HEADING = "text-[10px] uppercase tracking-wide text-muted";
 const MAX_EVENTS = 8;
-
-function hhmm(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-}
 
 function eventText(e: LlmRouterEvent): string {
   if (e.state === "loading") return "loading…";
@@ -30,7 +23,7 @@ function groupErrors(errors: RouterError[]): { e: RouterError; count: number }[]
     const prev = out[out.length - 1];
     if (
       prev &&
-      hhmm(prev.e.at) === hhmm(e.at) &&
+      formatTime(prev.e.at, false) === formatTime(e.at, false) &&
       prev.e.model === e.model &&
       prev.e.status === e.status &&
       prev.e.message === e.message
@@ -148,7 +141,7 @@ export function RouterPanel({
                   <div
                     key={b.hourStart}
                     className="flex h-full min-w-0 flex-1 flex-col-reverse"
-                    title={`${hhmm(b.hourStart)} — ${b.ok} ok, ${b.rejected} rejected (429), ${b.failed} failed`}
+                    title={`${formatTime(b.hourStart, false)} — ${b.ok} ok, ${b.rejected} rejected (429), ${b.failed} failed`}
                   >
                     {b.ok > 0 && (
                       <div
@@ -180,7 +173,7 @@ export function RouterPanel({
                   className="truncate text-[10px] font-tabular text-danger"
                   title={e.message ?? undefined}
                 >
-                  {hhmm(e.at)} {e.model} {e.status}
+                  {formatTime(e.at, false)} {e.model} {e.status}
                   {e.message ? ` ${e.message}` : ""}
                   {count > 1 ? ` ×${count}` : ""}
                 </div>
@@ -195,7 +188,7 @@ export function RouterPanel({
           <div className={HEADING}>Swaps</div>
           {events.map((e) => (
             <div key={`${e.at}-${e.model}-${e.state}`} className="truncate text-xs text-muted">
-              <span className="font-tabular">{hhmm(e.at)}</span> {e.model}{" "}
+              <span className="font-tabular">{formatTime(e.at, false)}</span> {e.model}{" "}
               <span className={e.state === "ready" ? "text-text" : undefined}>{eventText(e)}</span>
             </div>
           ))}

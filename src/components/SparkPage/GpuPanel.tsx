@@ -5,21 +5,13 @@ import { ActivityIcon } from "../ui/icons";
 import { MetricBar } from "../ui/MetricBar";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 import { formatMb } from "../../shared/formatBytes";
+import { celsiusToFahrenheit, tempFormatter } from "../../shared/temperature";
 
 interface GpuPanelProps {
   gpu: GpuMetrics | null;
   sparkId: string;
   temperatureUnit: "celsius" | "fahrenheit";
   className?: string;
-}
-
-function celsiusToFahrenheit(c: number): number {
-  return Math.round(c * 9 / 5 + 32);
-}
-
-/** Tooltip formatter for °C-valued history, shown in the user's unit. */
-function tempFormatter(unit: "celsius" | "fahrenheit"): (c: number) => string {
-  return (c) => (unit === "fahrenheit" ? `${celsiusToFahrenheit(c)}°F` : `${Number(c.toFixed(1))}°C`);
 }
 
 /** "NVIDIA GeForce RTX 5080" → "RTX 5080" for the per-card rows. */
