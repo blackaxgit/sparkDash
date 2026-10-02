@@ -1151,6 +1151,7 @@ export class LlmProbe {
    */
   async routerUnload(model) {
     if (!isSafePathId(model)) return { ok: false, status: 400, message: "invalid model id" };
+    const gen = this._routerGen;
     try {
       const res = await this._fetch(
         `${this.baseUrl}/api/models/unload/${encodeURIComponent(model)}`,
@@ -1165,7 +1166,8 @@ export class LlmProbe {
     } catch (err) {
       return { ok: false, status: 0, message: err?.message || String(err) };
     } finally {
-      this._modelsNextAt = 0; // the loaded flags changed; re-read on the next poll
+      // The loaded flags changed; re-read on the next poll (unless the router was reset meanwhile).
+      if (gen === this._routerGen) this._modelsNextAt = 0;
     }
   }
 
