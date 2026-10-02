@@ -21,6 +21,28 @@ function eventText(e: LlmRouterEvent): string {
   return e.loadMs != null ? `ready · loaded in ${formatDuration(e.loadMs)}` : "ready";
 }
 
+type RouterError = NonNullable<LlmMetrics["routerActivity"]>["recentErrors"][number];
+
+/** One line per distinct minute/model/status/message, so a burst of identical 429s reads as "×N". */
+function groupErrors(errors: RouterError[]): { e: RouterError; count: number }[] {
+  const out: { e: RouterError; count: number }[] = [];
+  for (const e of errors) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      hhmm(prev.e.at) === hhmm(e.at) &&
+      prev.e.model === e.model &&
+      prev.e.status === e.status &&
+      prev.e.message === e.message
+    ) {
+      prev.count += 1;
+    } else {
+      out.push({ e, count: 1 });
+    }
+  }
+  return out;
+}
+
 /**
  * llama-swap router observability: load control, request outcomes and model
  * swaps. Renders nothing on a non-router endpoint.
@@ -152,7 +174,7 @@ export function RouterPanel({
           )}
           {activity && activity.recentErrors.length > 0 && (
             <div className="space-y-0.5 pt-1">
-              {activity.recentErrors.slice(0, 5).map((e, i) => (
+              {groupErrors(activity.recentErrors.slice(0, 5)).map(({ e, count }, i) => (
                 <div
                   key={`${e.at}-${i}`}
                   className="truncate text-[10px] font-tabular text-danger"
@@ -160,6 +182,7 @@ export function RouterPanel({
                 >
                   {hhmm(e.at)} {e.model} {e.status}
                   {e.message ? ` ${e.message}` : ""}
+                  {count > 1 ? ` ×${count}` : ""}
                 </div>
               ))}
             </div>
