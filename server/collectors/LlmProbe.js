@@ -7,7 +7,8 @@
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
 import { classifyHostScope } from "../validate.js";
 import { llmProbeHost } from "./llmHost.js";
-import { generationTokensFromMetrics } from "./LlmStreaming.js";
+import { fetch as undiciFetch } from "undici";
+import { generationTokensFromMetrics, LLM_STREAM_AGENT } from "./LlmStreaming.js";
 import {
   isSwapOwner,
   parseRunning,
@@ -16,11 +17,26 @@ import {
   upstreamBase,
   processStartTime,
   pickNewestEngine,
+  diffRouterRows,
+  buildRouterActivity,
+  parseRouterModels,
+  promptTokensFromMetrics,
 } from "./swapRouter.js";
 import { detectComfyUpstream, isKnownComfyModel, noteComfyModel, readJsonCapped } from "./comfyDetect.js";
 
 /** llama-swap /running lists a handful of rows; a bigger body is hostile or broken. */
 const RUNNING_MAX_BYTES = 256 * 1024;
+/** The activity page is up to 999 rows (~300 KB); a bigger body is broken or hostile. */
+const ACTIVITY_MAX_BYTES = 1_500_000;
+const MODELS_MAX_BYTES = 512 * 1024;
+/** Activity and the model list are read at most this often, inside the router poll. */
+const ROUTER_REFRESH_MS = 60_000;
+/** An activity endpoint that 404s (older llama-swap) is asked again this rarely. */
+const ACTIVITY_MISSING_BACKOFF_MS = 10 * 60_000;
+const ACTIVITY_TIMEOUT_MS = 5_000;
+const ROUTER_UNLOAD_TIMEOUT_MS = 60_000;
+/** A model load queued behind a video studio can wait a long time. */
+const ROUTER_LOAD_TIMEOUT_MS = 20 * 60_000;
 
 const FAIL_RESET_THRESHOLD = 3;
 const REDETECT_INTERVAL_MS = 60_000;
@@ -110,9 +126,23 @@ export class LlmProbe {
     this._swapMisses = 0;
     /**
      * Per-resident-model generated tokens and live rate.
-     * @type {Map<string, {engineId: string, name: string|null, total: number, tps: number, at: number}>}
+     * @type {Map<string, {engineId: string, name: string|null, total: number, tps: number, promptTotal: number|null, promptTps: number, at: number}>}
      */
     this._engineStats = new Map();
+    /** Last /running rows (null before the first poll); the router action routes check against them. */
+    this._routerRows = null;
+    /** Per-model state of the previous poll, for event diffing. Null until the first poll seeds it. */
+    this._routerPrev = null;
+    /** @type {import("../../src/api/types").LlmRouterEvent[]} Newest first, max 30. */
+    this.routerEvents = [];
+    /** @type {import("../../src/api/types").LlmRouterActivity | null} */
+    this.routerActivity = null;
+    /** @type {import("../../src/api/types").LlmRouterModel[]} */
+    this.routerModels = [];
+    this._activityNextAt = 0;
+    this._modelsNextAt = 0;
+    /** True while a fire-and-forget model load is outstanding. */
+    this._routerLoadInFlight = false;
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
     this.stepId = 0;
@@ -753,6 +783,12 @@ export class LlmProbe {
       /* reported below */
     }
     if (rows == null) throw new Error("llama-swap /running unreachable");
+    const polledAt = Date.now();
+    this._routerRows = rows;
+    const diff = diffRouterRows(this._routerPrev, rows, polledAt, this.routerEvents);
+    this._routerPrev = diff.state;
+    this.routerEvents = diff.events;
+    await Promise.all([this._refreshRouterActivity(polledAt), this._refreshRouterModels(polledAt)]);
 
     // A ComfyUI studio is a llama-swap member but not an LLM engine: it has no
     // /metrics and no chat API, so it must stay out of engine selection, the
@@ -907,6 +943,7 @@ export class LlmProbe {
       seen.add(model);
       const id = c.startedAt != null ? `${model}@${c.startedAt}` : model;
       const total = c.metrics != null ? generationTokensFromMetrics(c.metrics) : null;
+      const promptTotal = c.metrics != null ? promptTokensFromMetrics(c.metrics) : null;
       const prev = this._engineStats.get(model);
       if (!prev || prev.engineId !== id) {
         // New process: seed, never diff across the restart.
@@ -915,16 +952,28 @@ export class LlmProbe {
           name: c.row.name,
           total: total ?? 0,
           tps: 0,
+          promptTotal,
+          promptTps: 0,
           at: now,
         });
         continue;
       }
       prev.name = c.row.name;
-      if (total == null) continue;
+      if (total == null && promptTotal == null) continue;
       const dt = (now - prev.at) / 1000;
-      if (total < prev.total) prev.tps = 0;
-      else if (dt > 0 && dt < 10) prev.tps = Math.round(((total - prev.total) / dt) * 100) / 100;
-      prev.total = total;
+      if (total != null) {
+        if (total < prev.total) prev.tps = 0;
+        else if (dt > 0 && dt < 10) prev.tps = Math.round(((total - prev.total) / dt) * 100) / 100;
+        prev.total = total;
+      }
+      if (promptTotal != null) {
+        // A counter first seen after the seed has no baseline to diff against.
+        if (prev.promptTotal == null || promptTotal < prev.promptTotal) prev.promptTps = 0;
+        else if (dt > 0 && dt < 10) {
+          prev.promptTps = Math.round(((promptTotal - prev.promptTotal) / dt) * 100) / 100;
+        }
+        prev.promptTotal = promptTotal;
+      }
       prev.at = now;
     }
     for (const model of this._engineStats.keys()) {
@@ -942,6 +991,7 @@ export class LlmProbe {
         generationTps: st.tps,
         totalOutputTokens: st.total,
         active: model === this.routerModel,
+        promptTps: st.promptTps,
       });
     }
     rows.sort((a, b) => {
@@ -949,6 +999,96 @@ export class LlmProbe {
       return a.model.localeCompare(b.model);
     });
     return rows;
+  }
+
+  /** Request outcomes from llama-swap's activity log; keeps the previous value on failure. */
+  async _refreshRouterActivity(now) {
+    if (now < this._activityNextAt) return;
+    this._activityNextAt = now + ROUTER_REFRESH_MS;
+    try {
+      const start = encodeURIComponent(new Date(now - 24 * 3_600_000).toISOString());
+      const res = await this._fetch(`${this.baseUrl}/api/metrics/activity?limit=999&start=${start}`, {
+        timeoutMs: ACTIVITY_TIMEOUT_MS,
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        if (res.status === 404) this._activityNextAt = now + ACTIVITY_MISSING_BACKOFF_MS;
+        return;
+      }
+      const activity = buildRouterActivity(await readJsonCapped(res, ACTIVITY_MAX_BYTES), now);
+      if (activity) this.routerActivity = activity;
+    } catch {
+      /* keep the previous value */
+    }
+  }
+
+  /** Configured models from /v1/models; keeps the previous list on failure. */
+  async _refreshRouterModels(now) {
+    if (now < this._modelsNextAt) return;
+    this._modelsNextAt = now + ROUTER_REFRESH_MS;
+    try {
+      const res = await this._fetch(`${this.baseUrl}/v1/models`);
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return;
+      }
+      const models = parseRouterModels(await readJsonCapped(res, MODELS_MAX_BYTES));
+      if (models) this.routerModels = models;
+    } catch {
+      /* keep the previous list */
+    }
+  }
+
+  /**
+   * Unload one model (llama-swap POST /api/models/unload/{model}).
+   * @param {string} model
+   * @returns {Promise<{ok: boolean, status: number, message: string}>}
+   */
+  async routerUnload(model) {
+    try {
+      const res = await this._fetch(
+        `${this.baseUrl}/api/models/unload/${encodeURIComponent(model)}`,
+        { method: "POST", timeoutMs: ROUTER_UNLOAD_TIMEOUT_MS }
+      );
+      const body = await res.text().catch(() => "");
+      return {
+        ok: res.ok,
+        status: res.status,
+        message: res.ok ? "unloaded" : body.trim().slice(0, 200) || `HTTP ${res.status}`,
+      };
+    } catch (err) {
+      return { ok: false, status: 0, message: err?.message || String(err) };
+    } finally {
+      this._modelsNextAt = 0; // the loaded flags changed; re-read on the next poll
+    }
+  }
+
+  /**
+   * Ask llama-swap to load one model by requesting its health endpoint, which
+   * blocks until the model is up. Fire-and-forget; one load in flight per probe.
+   * @param {string} model
+   * @returns {{started: true} | {started: false, reason: "busy"}}
+   */
+  routerLoad(model) {
+    if (this._routerLoadInFlight) return { started: false, reason: "busy" };
+    this._routerLoadInFlight = true;
+    const t0 = Date.now();
+    void (async () => {
+      try {
+        const res = await this._fetch(
+          `${this.baseUrl}/upstream/${encodeURIComponent(model)}/health`,
+          { timeoutMs: ROUTER_LOAD_TIMEOUT_MS, longLived: true }
+        );
+        await res.body?.cancel().catch(() => {});
+        console.log(`[LlmProbe] router load ${model} on :${this.port} -> HTTP ${res.status} after ${Date.now() - t0} ms`);
+      } catch (err) {
+        console.log(`[LlmProbe] router load ${model} on :${this.port} failed after ${Date.now() - t0} ms: ${err?.message || err}`);
+      } finally {
+        this._routerLoadInFlight = false;
+        this._modelsNextAt = 0;
+      }
+    })();
+    return { started: true };
   }
 
   /**
@@ -2260,6 +2400,9 @@ export class LlmProbe {
       engineId: this.engineId,
       routerResident: this.routerResident,
       routerEngines: this._routerEngines(),
+      routerEvents: this.routerEvents,
+      routerActivity: this.routerActivity,
+      routerModels: this.routerModels,
       posture: this._buildPosture(),
       error: this.error,
     };
@@ -2299,6 +2442,9 @@ export class LlmProbe {
       studio: null,
       routerResident: this.routerResident,
       routerEngines: this._routerEngines(),
+      routerEvents: [],
+      routerActivity: null,
+      routerModels: [],
       posture: this._buildPosture(),
       error: this.error,
     };
@@ -2328,20 +2474,25 @@ export class LlmProbe {
 
   /**
    * @param {string} url
-   * @param {{ authenticated?: boolean }} [opts] `authenticated: false` sends no
-   *   credentials (probing an upstream origin the router merely names).
+   * @param {{ authenticated?: boolean, method?: string, timeoutMs?: number, longLived?: boolean }} [opts]
+   *   `authenticated: false` sends no credentials (probing an upstream origin the
+   *   router merely names). `longLived` lifts undici's 300 s header/body idle cut
+   *   for a request that is expected to block (a model load).
    */
-  async _fetch(url, { authenticated = true } = {}) {
+  async _fetch(
+    url,
+    { authenticated = true, method = "GET", timeoutMs = LLM_PROBE_TIMEOUT_MS, longLived = false } = {}
+  ) {
     const headers = {};
     const apiKey = authenticated ? this._apiKey() : null;
     if (apiKey && this._sameHostAsProbe(url)) headers.Authorization = `Bearer ${apiKey}`;
     // A 3xx is a failure, never followed: a redirect would carry the probe (and
     // its credentials) to a host the operator did not approve.
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS),
-      headers,
-      redirect: "manual",
-    });
+    const init = { method, signal: AbortSignal.timeout(timeoutMs), headers, redirect: "manual" };
+    // undici's own fetch must be paired with its own Agent (see LLM_STREAM_AGENT).
+    const res = longLived
+      ? await undiciFetch(url, { ...init, dispatcher: LLM_STREAM_AGENT })
+      : await fetch(url, init);
     // Release a redirect's socket now instead of at the timeout; callers see !ok.
     if (res.status >= 300 && res.status < 400) await res.body?.cancel().catch(() => {});
     return res;

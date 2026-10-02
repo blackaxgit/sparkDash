@@ -208,6 +208,37 @@ test("a liveness check from an earlier run cannot commit or clear a restarted ch
   monitor.stop();
 });
 
+test("domains do not poll while a liveness check says offline, and resume when it flips back", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const monitor = new SparkMonitor(spark());
+  monitor._running = true;
+  let gpuPolls = 0;
+  monitor.collector.collectGpu = async () => {
+    gpuPolls += 1;
+    return tagged(validGpu());
+  };
+  monitor._readUptime = async () => 5;
+  let reachable = false;
+  monitor.collector.pingHost = async () => {
+    if (!reachable) throw new Error("unreachable");
+  };
+
+  // Initial state (no liveness result yet): online is false but domains still poll.
+  await monitor._pollDomain("gpu");
+  assert.equal(gpuPolls, 1);
+
+  await monitor._checkOnline();
+  assert.equal(monitor.online, false);
+  await monitor._pollDomain("gpu");
+  assert.equal(gpuPolls, 1, "offline host is not polled");
+
+  reachable = true;
+  await monitor._checkOnline();
+  assert.equal(monitor.online, true);
+  await monitor._pollDomain("gpu");
+  assert.equal(gpuPolls, 2, "polling resumes once liveness flips back");
+});
+
 test("a storage refresh from an earlier run cannot commit or clear a restarted refresh", async (t) => {
   t.mock.method(console, "log", () => {});
   t.mock.method(globalThis, "setInterval", () => Symbol("interval"));

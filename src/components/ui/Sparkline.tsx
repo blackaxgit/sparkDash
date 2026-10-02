@@ -17,6 +17,13 @@ interface SparklineProps {
    * of how far the box is stretched.
    */
   stretch?: boolean;
+  /**
+   * Unit suffix (e.g. "%", "°C"). When set, an SVG `<title>` tooltip reports
+   * last / min / max / avg of the plotted samples in this unit.
+   */
+  unit?: string;
+  /** Accessible name for the chart (sets role="img" + aria-label). */
+  ariaLabel?: string;
 }
 
 /**
@@ -31,6 +38,8 @@ export function Sparkline({
   color = "var(--color-accent)",
   area = true,
   stretch = false,
+  unit,
+  ariaLabel,
 }: SparklineProps) {
   if (data.length < 2) {
     return (
@@ -51,6 +60,16 @@ export function Sparkline({
     const y = height - pad - ((v - min) / span) * (height - pad * 2);
     return `${x},${y}`;
   });
+  const titleText =
+    unit !== undefined
+      ? (() => {
+          const fmt = (v: number) => `${Number(v.toFixed(1))}${unit}`;
+          const dMin = Math.min(...data);
+          const dMax = Math.max(...data);
+          const avg = data.reduce((a, b) => a + b, 0) / data.length;
+          return `last ${fmt(data[data.length - 1])} · min ${fmt(dMin)} · max ${fmt(dMax)} · avg ${fmt(avg)}`;
+        })()
+      : null;
 
   const areaPath = `M0,${height} L${points.join(" L")} L${width},${height} Z`;
   const lineColor = color;
@@ -63,7 +82,12 @@ export function Sparkline({
     : { width, className: "inline-block align-middle" };
 
   return (
-    <svg height={height} {...frame}>
+    <svg
+      height={height}
+      {...frame}
+      {...(ariaLabel ? { role: "img", "aria-label": ariaLabel } : {})}
+    >
+      {titleText && <title>{titleText}</title>}
       {area && (
         <path d={areaPath} fill={fillColor} stroke="none" vectorEffect="non-scaling-stroke" />
       )}

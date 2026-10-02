@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { LlmMetrics, LlmBenchTarget, VideoLlmWait } from "../../api/types";
-import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
+import { routerUnload, setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
@@ -18,6 +18,7 @@ import { LlmTokenTotals } from "./LlmTokenTotals";
 import { parseLlmTargetInput } from "../../shared/llmTarget.js";
 import { backendLabel } from "../../shared/llmBackends.js";
 import { LlmTrendChart } from "./LlmTrendChart";
+import { RouterPanel } from "./RouterPanel";
 
 /**
  * Wall-clock span of a chart, for the age axis. Whole units only: the axis
@@ -455,6 +456,20 @@ export function LlmPanel({
   const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [unloading, setUnloading] = useState<string | null>(null);
+  const [unloadError, setUnloadError] = useState<string | null>(null);
+  const handleUnload = async (model: string) => {
+    if (!confirm(`Unload ${model}? Requests to it will cold-start it again.`)) return;
+    setUnloading(model);
+    setUnloadError(null);
+    try {
+      await routerUnload(sparkId, llmPort, model);
+    } catch (err) {
+      setUnloadError(err instanceof Error ? err.message : "Unload failed");
+    } finally {
+      setUnloading(null);
+    }
+  };
   const [engineInfoOpen, setEngineInfoOpen] = useState(false);
   const [benchOpen, setBenchOpen] = useState(false);
   const [prefillBenchOpen, setPrefillBenchOpen] = useState(false);
@@ -732,6 +747,7 @@ export function LlmPanel({
                     : `No model loaded on :${llmPort}`}
             </p>
           </div>
+          {llm?.error && <p className="text-[10px] text-danger">{llm.error}</p>}
           <LlmLaunchers
             sparkId={sparkId}
             llmPort={llmPort}
@@ -741,6 +757,7 @@ export function LlmPanel({
             onRemoteDecode={openRemoteDecode}
             onRemotePrefill={openRemotePrefill}
           />
+          {llm && <RouterPanel sparkId={sparkId} llmPort={llmPort} llm={llm} />}
           <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
@@ -873,7 +890,7 @@ export function LlmPanel({
             the followed one, so name every model that is holding memory with
             its own tokens — otherwise a busy second model looks idle.
           */}
-          {(llm?.routerEngines?.length ?? 0) > 1 && (
+          {(llm?.routerEngines?.length ?? 0) > 0 && (
             <div className="space-y-1 border-t border-border pt-3">
               <div className="text-[10px] uppercase tracking-wide text-muted">
                 Resident models
@@ -895,16 +912,36 @@ export function LlmPanel({
                   >
                     {e.generationTps.toFixed(1)} tok/s
                   </span>
+                  {(e.promptTps ?? 0) > 0 || e.generationTps === 0 ? (
+                    <span
+                      className="shrink-0 text-right font-tabular text-muted"
+                      title="Live prompt (prefill) rate of this engine"
+                    >
+                      prompt {(e.promptTps ?? 0).toFixed(1)} tok/s
+                    </span>
+                  ) : null}
                   <span
                     className="w-24 shrink-0 text-right font-tabular text-muted"
                     title="Tokens this engine has generated since it started"
                   >
                     {e.totalOutputTokens.toLocaleString()}
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleUnload(e.model)}
+                    disabled={unloading !== null}
+                    className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:border-danger hover:text-danger disabled:opacity-50"
+                    title={`Unload ${e.model}`}
+                  >
+                    {unloading === e.model ? "Unloading…" : "Unload"}
+                  </button>
                 </div>
               ))}
+              {unloadError && <p className="text-[10px] text-danger">{unloadError}</p>}
             </div>
           )}
+
+          {llm && <RouterPanel sparkId={sparkId} llmPort={llmPort} llm={llm} />}
 
           <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
             {/*

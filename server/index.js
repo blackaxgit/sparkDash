@@ -43,7 +43,7 @@ import {
 } from "./llmtokens/LlmTokenRuntime.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
 import { llmHourly } from "./collectors/LlmHourly.js";
-import { metricsHistory, MAX_SAMPLES } from "./collectors/MetricsHistory.js";
+import { metricsHistory, MAX_SAMPLES, HISTORY_RANGES } from "./collectors/MetricsHistory.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 import { FLEET_ENERGY_JSON_PATH } from "./config.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
@@ -545,6 +545,32 @@ app.post("/api/sparks/:id/test", async (req, res) => {
   }
 });
 
+// Stop the running studio render or dequeue a pending one (video studio queue only).
+app.post("/api/sparks/:id/video/cancel", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many cancellation requests; try again shortly");
+  }
+  try {
+    const spark = registry.getSpark(req.params.id);
+    const mon = monitors.get(req.params.id);
+    if (!spark || !mon?.videoProbe) return res.status(404).json({ error: "Video studio not found" });
+    const promptId = req.body?.promptId;
+    if (!promptId || typeof promptId !== "string" || promptId.length > 64) {
+      return res.status(400).json({ error: "promptId is required (max 64 characters)" });
+    }
+    const port = mon.videoProbe.studioPort();
+    if (port == null) return res.status(409).json({ error: "No video studio is resident" });
+    if (!mon.videoProbe.hasJob(promptId)) {
+      return res.status(409).json({ error: "Job is not in the studio queue" });
+    }
+    const result = await comfyCancelJob(spark, promptId, port);
+    void mon._pollDomain("video");
+    res.json({ success: result.ok, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Cancel a ComfyUI job (running interrupt and/or pending dequeue).
 app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
   if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
@@ -565,6 +591,102 @@ app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
     const mon = monitors.get(req.params.id);
     if (mon) void mon._pollDomain?.("comfy");
     res.json({ success: result.ok, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Shared prelude of the llama-swap router action routes: resolve the spark and the
+ * router probe named by the body, and validate `{port, model}`. Sends the error
+ * response itself and returns null when the request cannot proceed.
+ */
+function resolveRouterAction(req, res) {
+  const spark = registry.getSpark(req.params.id);
+  const mon = monitors.get(req.params.id);
+  if (!spark || !mon) {
+    res.status(404).json({ error: "Spark not found" });
+    return null;
+  }
+  const { port, model } = req.body || {};
+  if (!Number.isInteger(port) || typeof model !== "string" || !model || model.length > 200) {
+    res.status(400).json({ error: "port (number) and model (string, max 200 characters) are required" });
+    return null;
+  }
+  const probe = mon.llmProbes.get(port);
+  if (!probe) {
+    res.status(404).json({ error: `No LLM endpoint on port ${port}` });
+    return null;
+  }
+  if (probe.router !== "llama-swap") {
+    res.status(400).json({ error: `Port ${port} is not a llama-swap router` });
+    return null;
+  }
+  return { mon, probe, model };
+}
+
+/** The video studio's name and render counts, from the monitor's last video snapshot. */
+function videoStudioLoad(mon) {
+  const video = mon.snapshot().metrics.video;
+  const studio = video?.studio ?? null;
+  return {
+    studio,
+    running: video?.queueRunning ?? 0,
+    queued: video?.queuePending ?? 0,
+  };
+}
+
+// Unload one model behind a llama-swap router.
+app.post("/api/sparks/:id/llm/router/unload", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many unload requests; try again shortly");
+  }
+  try {
+    const target = resolveRouterAction(req, res);
+    if (!target) return;
+    const { mon, probe, model } = target;
+    if (!probe._routerRows?.some((r) => r.model === model)) {
+      return res.status(409).json({ error: `${model} is not running` });
+    }
+    const { studio, running, queued } = videoStudioLoad(mon);
+    if (studio?.model === model && running + queued > 0) {
+      return res.status(409).json({
+        error: `Video studio ${studio.name || model} has ${running} running and ${queued} queued render(s); cancel the renders first`,
+      });
+    }
+    const result = await probe.routerUnload(model);
+    void mon._pollDomain("llm");
+    if (!result.ok) return res.status(502).json({ error: result.message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start loading one model behind a llama-swap router (fire-and-forget; the panel watches /running).
+app.post("/api/sparks/:id/llm/router/load", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many load requests; try again shortly");
+  }
+  try {
+    const target = resolveRouterAction(req, res);
+    if (!target) return;
+    const { mon, probe, model } = target;
+    const known = probe.routerModels.find((m) => m.id === model);
+    if (!known) return res.status(409).json({ error: `${model} is not a configured model` });
+    if (known.loaded || probe._routerRows?.some((r) => r.model === model)) {
+      return res.status(409).json({ error: `${model} is already loaded` });
+    }
+    const { studio, running, queued } = videoStudioLoad(mon);
+    if (studio && studio.state !== "unloaded" && running + queued > 0) {
+      return res.status(409).json({
+        error: `GPU held by video studio ${studio.name || studio.model} (${running} running, ${queued} queued)`,
+      });
+    }
+    if (!probe.routerLoad(model).started) {
+      return res.status(409).json({ error: "A model load is already in flight" });
+    }
+    res.status(202).json({ success: true, status: "loading" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -993,6 +1115,20 @@ app.get("/api/sparks/:id/llm/hourly", (req, res) => {
   let hours = req.query.hours != null ? Number(req.query.hours) : 24;
   if (!Number.isFinite(hours)) hours = 24;
   res.json(llmHourly.getSeries(spark.id, port, { hours }));
+});
+
+/**
+ * Long-term downsampled metric series (1-minute averages kept 7 days).
+ * Query: range = 1h | 24h | 7d (default 24h).
+ */
+app.get("/api/sparks/:id/history", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const range = req.query.range != null ? String(req.query.range) : "24h";
+  if (!Object.hasOwn(HISTORY_RANGES, range)) {
+    return res.status(400).json({ error: "Invalid range (use 1h, 24h or 7d)" });
+  }
+  res.json(metricsHistory.getRange(spark.id, range));
 });
 
 /**

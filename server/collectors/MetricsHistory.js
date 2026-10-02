@@ -21,6 +21,11 @@
  * (LlmPanel's "28 min ago … now" axis) instead of assuming samples are one
  * poll interval apart — an assumption that breaks the moment a host goes
  * offline and the series stops growing while time keeps passing.
+ *
+ * LONG TIER: independent of the above, recordSnapshot() also folds every tick
+ * into per-minute averages kept for 7 days (config/metrics-history-long.json)
+ * and served by getRange() to GET /api/sparks/:id/history. It does not touch
+ * the short tier or the WS `history` message.
  */
 import fs from "fs";
 import path from "path";
@@ -29,6 +34,60 @@ import { atomicWrite } from "../util/atomicWrite.js";
 
 export const METRICS_HISTORY_JSON_PATH =
   process.env.METRICS_HISTORY_JSON_PATH || path.join(ROOT, "config", "metrics-history.json");
+
+export const METRICS_HISTORY_LONG_JSON_PATH =
+  process.env.METRICS_HISTORY_LONG_JSON_PATH ||
+  path.join(ROOT, "config", "metrics-history-long.json");
+
+const MINUTE_MS = 60_000;
+/** Long-tier retention: 7 days of one-minute points. */
+const LONG_MAX_POINTS = 7 * 24 * 60;
+const LONG_RETENTION_MS = LONG_MAX_POINTS * MINUTE_MS;
+const LONG_FLUSH_MS = 5 * 60_000;
+/** range → [span ms, step ms] */
+export const HISTORY_RANGES = {
+  "1h": [3_600_000, 60_000],
+  "24h": [86_400_000, 60_000],
+  "7d": [604_800_000, 600_000],
+};
+
+/** Drop leading points older than the retention window or beyond the cap. */
+function trimLong(entry, now) {
+  const cutoff = now - LONG_RETENTION_MS;
+  let drop = entry.start < cutoff ? Math.ceil((cutoff - entry.start) / MINUTE_MS) : 0;
+  drop = Math.max(drop, entry.values.length - LONG_MAX_POINTS);
+  if (drop > 0) {
+    entry.values.splice(0, drop);
+    entry.start += drop * MINUTE_MS;
+  }
+}
+
+/** Per-minute figures worth charting over days, keyed without the spark prefix. */
+function longSamples(m, llmPorts) {
+  const out = {};
+  if (m.gpu) {
+    out["gpu.usage"] = m.gpu.usage;
+    out["gpu.temp"] = m.gpu.temperature;
+    out["gpu.power"] = m.gpu.power?.draw;
+  }
+  out["mem.percentage"] = m.unifiedMemory?.percentage ?? m.ram?.percentage;
+  if (m.cpu) out["cpu.usage"] = m.cpu.usage;
+  const net = m.network;
+  if (net && Array.isArray(net.interfaces)) {
+    const nic = net.interfaces.find((i) => i.name === net.primaryInterface);
+    if (nic) {
+      out["net.rx"] = nic.rxSpeed;
+      out["net.tx"] = nic.txSpeed;
+    }
+  }
+  if (Array.isArray(m.llm)) {
+    for (let i = 0; i < m.llm.length; i++) {
+      const port = llmPorts?.[i];
+      out[`llm:${port != null ? port : i}.tps`] = m.llm[i]?.generationTps;
+    }
+  }
+  return out;
+}
 
 /** 1 h at the 1 s floor on pollIntervalMs; 2 h if someone sets 2 s. */
 export const MAX_SAMPLES = 3600;
@@ -70,8 +129,13 @@ function rebuildTimes(n, t0, tLast) {
 }
 
 export class MetricsHistoryStore {
-  constructor(filePath = METRICS_HISTORY_JSON_PATH, max = MAX_SAMPLES) {
+  constructor(filePath = METRICS_HISTORY_JSON_PATH, max = MAX_SAMPLES, longFilePath) {
     this.filePath = filePath;
+    this.longFilePath =
+      longFilePath ??
+      (filePath === METRICS_HISTORY_JSON_PATH
+        ? METRICS_HISTORY_LONG_JSON_PATH
+        : filePath.replace(/\.json$/i, "") + "-long.json");
     this.max = max;
     /** @type {Map<string, number[]>} */
     this._series = new Map();
@@ -79,7 +143,140 @@ export class MetricsHistoryStore {
     this._times = new Map();
     this._dirty = false;
     this._flushTimer = null;
+    /** @type {Map<string, {start: number, values: (number|null)[]}>} one point per minute */
+    this._long = new Map();
+    /** @type {Map<string, {minute: number, sum: number, count: number}>} minute in progress */
+    this._acc = new Map();
+    this._longDirty = false;
+    this._longFlushTimer = null;
     this._load();
+    this._loadLong();
+  }
+
+  _loadLong() {
+    try {
+      if (!fs.existsSync(this.longFilePath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.longFilePath, "utf8"));
+      if (!raw || typeof raw !== "object") return;
+      const now = Date.now();
+      for (const [key, e] of Object.entries(raw.series || {})) {
+        if (!e || !Number.isFinite(e.start) || !Array.isArray(e.values)) continue;
+        const entry = {
+          start: e.start,
+          values: e.values.map((v) => (typeof v === "number" && Number.isFinite(v) ? v : null)),
+        };
+        trimLong(entry, now);
+        if (entry.values.some((v) => v !== null)) this._long.set(key, entry);
+      }
+    } catch {
+      this._long.clear();
+    }
+  }
+
+  _scheduleLongFlush() {
+    if (this._longFlushTimer) return;
+    this._longFlushTimer = setTimeout(() => {
+      this._longFlushTimer = null;
+      this.flushLong();
+    }, LONG_FLUSH_MS);
+    this._longFlushTimer.unref?.();
+  }
+
+  flushLong() {
+    if (!this._longDirty) return;
+    try {
+      atomicWrite(
+        this.longFilePath,
+        JSON.stringify({ updatedAt: Date.now(), series: Object.fromEntries(this._long) })
+      );
+      this._longDirty = false;
+    } catch (err) {
+      console.error("[MetricsHistory] long-tier write failed:", err.message);
+    }
+  }
+
+  /** Write the finished minute's average into the key's minute grid. */
+  _commitMinute(key, acc) {
+    const avg = round2(acc.sum / acc.count);
+    let entry = this._long.get(key);
+    const idx = entry ? Math.round((acc.minute - entry.start) / MINUTE_MS) : 0;
+    if (!entry || idx > LONG_MAX_POINTS) {
+      entry = { start: acc.minute, values: [avg] };
+      this._long.set(key, entry);
+    } else if (idx >= 0) {
+      while (entry.values.length < idx) entry.values.push(null);
+      entry.values[idx] = avg;
+    } else {
+      return; // older than the grid start; samples arrive in time order, so ignore
+    }
+    trimLong(entry, acc.minute);
+    this._longDirty = true;
+    this._scheduleLongFlush();
+  }
+
+  _accumulate(key, value, minute) {
+    const v = Number(value);
+    if (value == null || !Number.isFinite(v)) return;
+    const acc = this._acc.get(key);
+    if (acc && acc.minute === minute) {
+      acc.sum += v;
+      acc.count++;
+    } else {
+      this._acc.set(key, { minute, sum: v, count: 1 });
+    }
+  }
+
+  /** Commit every in-progress minute that is older than `minute`. */
+  _rollMinutes(minute) {
+    for (const [key, acc] of this._acc) {
+      if (acc.minute < minute) {
+        this._commitMinute(key, acc);
+        this._acc.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Downsampled history for one spark, ending at `now`.
+   * @param {string} sparkId
+   * @param {"1h"|"24h"|"7d"} range
+   * @returns {{range: string, stepMs: number, series: Record<string, [number, number|null][]>}}
+   */
+  getRange(sparkId, range, now = Date.now()) {
+    const [span, step] = HISTORY_RANGES[range];
+    const n = span / step;
+    const first = Math.floor(now / step) * step - (n - 1) * step;
+    const prefix = `${sparkId}:`;
+    const series = {};
+    const keys = new Set([...this._long.keys(), ...this._acc.keys()]);
+    for (const key of keys) {
+      if (!key.startsWith(prefix)) continue;
+      const entry = this._long.get(key);
+      const acc = this._acc.get(key);
+      const points = [];
+      let any = false;
+      for (let i = 0; i < n; i++) {
+        const t = first + i * step;
+        let sum = 0;
+        let count = 0;
+        for (let m = t; m < t + step; m += MINUTE_MS) {
+          let v = null;
+          if (entry) {
+            const idx = (m - entry.start) / MINUTE_MS;
+            if (idx >= 0 && idx < entry.values.length) v = entry.values[idx];
+          }
+          if (v === null && acc && acc.minute === m) v = round2(acc.sum / acc.count);
+          if (v !== null) {
+            sum += v;
+            count++;
+          }
+        }
+        if (count) any = true;
+        points.push([t, count ? round2(sum / count) : null]);
+      }
+      if (any) series[key.slice(prefix.length)] = points;
+    }
+    return { range, stepMs: step, series };
   }
 
   _load() {
@@ -113,6 +310,7 @@ export class MetricsHistoryStore {
   }
 
   flush() {
+    this.flushLong();
     if (!this._dirty) return;
     try {
       const times = {};
@@ -164,19 +362,24 @@ export class MetricsHistoryStore {
    * Record one tick from a full snapshot list. Mirrors the client's
    * ingestSnapshots() key-for-key — see KEY CONTRACT above.
    * @param {Array<object>} sparks
+   * @param {number} [at] tick timestamp (test seam; defaults to now)
    */
-  recordSnapshot(sparks) {
+  recordSnapshot(sparks, at = Date.now()) {
     if (!Array.isArray(sparks)) return;
     const alive = new Set();
     // One timestamp for the whole tick: series recorded together must report
     // the same start, otherwise two rows of one panel disagree by a few ms.
-    const at = Date.now();
+    const minute = Math.floor(at / MINUTE_MS) * MINUTE_MS;
+    this._rollMinutes(minute);
 
     for (const s of sparks) {
       if (!s || !s.id) continue;
       alive.add(s.id);
       if (!s.online) continue; // don't record zero-samples for offline hosts
       const m = s.metrics || {};
+      for (const [k, v] of Object.entries(longSamples(m, s.llmPorts))) {
+        this._accumulate(`${s.id}:${k}`, v, minute);
+      }
       if (m.gpu) {
         this.push(`${s.id}:gpu.usage`, m.gpu.usage, at);
         this.push(`${s.id}:gpu.temp`, m.gpu.temperature, at);
@@ -224,6 +427,15 @@ export class MetricsHistoryStore {
         this._dirty = true;
       }
     }
+    for (const map of [this._long, this._acc]) {
+      for (const key of [...map.keys()]) {
+        const id = key.slice(0, key.indexOf(":"));
+        if (id && !alive.has(id)) {
+          map.delete(key);
+          this._longDirty = true;
+        }
+      }
+    }
   }
 
   /** Hydration payload for a freshly connected client. */
@@ -248,6 +460,9 @@ export class MetricsHistoryStore {
     this._series.clear();
     this._times.clear();
     this._dirty = true;
+    this._long.clear();
+    this._acc.clear();
+    this._longDirty = true;
   }
 }
 

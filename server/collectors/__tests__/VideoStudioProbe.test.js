@@ -625,6 +625,57 @@ test("probe: history is refetched only every 30 s or when the running prompt cha
   probe.dispose();
 });
 
+test("hasJob: running, pending and unknown prompts", async () => {
+  const { probe } = newProbe({ running: RUNNING_WITH_STUDIO });
+  assert.equal(probe.hasJob("run-1"), null, "nothing known before the first poll");
+  await probe.probe();
+  assert.equal(probe.hasJob("run-1"), "running");
+  assert.equal(probe.hasJob("pend-1"), "pending");
+  assert.equal(probe.hasJob("pend-2"), "pending");
+  assert.equal(probe.hasJob("newOk"), null, "a finished job is not in the queue");
+  assert.equal(probe.hasJob(""), null);
+  assert.equal(probe.hasJob(undefined), null);
+  probe.dispose();
+});
+
+test("studioPort: set while the studio is ready, null once it leaves /running", async () => {
+  const state = { running: RUNNING_WITH_STUDIO };
+  const { fetchImpl } = makeFetch(state);
+  let now = T;
+  const probe = new VideoStudioProbe(
+    { isLocal: true },
+    { routerPorts: () => [11434], fetchImpl, now: () => now }
+  );
+  assert.equal(probe.studioPort(), null, "null before the first poll");
+  await probe.probe();
+  assert.equal(probe.studioPort(), 8189);
+
+  state.running = RUNNING_WITHOUT_STUDIO;
+  now = T + 3000;
+  await probe.probe();
+  assert.equal(probe.studioPort(), null);
+  assert.equal(probe.hasJob("run-1"), null, "live queue is dropped with the studio");
+  probe.dispose();
+});
+
+test("studioPort: null while the studio is restarting (loading)", async () => {
+  const state = { running: RUNNING_WITH_STUDIO };
+  let now = T;
+  const { probe } = newProbe(state, () => now);
+  await probe.probe();
+  assert.equal(probe.studioPort(), 8189);
+
+  state.running = {
+    running: [{ model: "h3-studio", state: "starting", proxy: COMFY, name: "MiniMax H3 video studio (ComfyUI)" }],
+  };
+  state.comfyStatsDown = true;
+  now = T + 3000;
+  const v = await probe.probe();
+  assert.equal(v.studio.state, "loading");
+  assert.equal(probe.studioPort(), null);
+  probe.dispose();
+});
+
 // ─── llmWait rules ──────────────────────────────────────────
 
 const RUNNING_LLM_SERVING = {

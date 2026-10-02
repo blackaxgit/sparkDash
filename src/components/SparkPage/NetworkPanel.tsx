@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { NetworkMetrics } from "../../api/types";
+import type { HostHealthMetrics, NetworkMetrics } from "../../api/types";
 import { updateDisabledInterfaces } from "../../api/client";
 import { Panel } from "../ui/Panel";
 import { NetworkIcon, GearIcon } from "../ui/icons";
@@ -10,6 +10,7 @@ interface NetworkPanelProps {
   sparkId: string;
   disabledInterfaces: string[];
   onDisabledChange: (interfaces: string[]) => void;
+  wifi?: HostHealthMetrics["wifi"];
   className?: string;
 }
 
@@ -38,6 +39,7 @@ export function NetworkPanel({
   disabledInterfaces,
   onDisabledChange,
   className,
+  wifi,
 }: NetworkPanelProps) {
   const [showSettings, setShowSettings] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -138,10 +140,19 @@ export function NetworkPanel({
             ) : (
               visible.map((iface) => {
                 const isPrimary = iface.name === primary;
+                const w = wifi?.find((x) => x.iface === iface.name);
+                const sigCls =
+                  w?.signalDbm == null
+                    ? "text-muted"
+                    : w.signalDbm >= -60
+                      ? "text-success"
+                      : w.signalDbm >= -70
+                        ? "text-warning"
+                        : "text-danger";
                 return (
                   <div
                     key={iface.name}
-                    className={`flex flex-col gap-0.5 sm:flex-row sm:items-center sm:justify-between rounded-md border px-3 py-2 ${
+                    className={`flex flex-col gap-0.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between rounded-md border px-3 py-2 ${
                       isPrimary
                         ? "border-accent/40 bg-accent-soft"
                         : "border-border bg-surface-elevated"
@@ -159,6 +170,13 @@ export function NetworkPanel({
                       <span className="mx-1.5 text-border">·</span>
                       <span className="text-accent">↓</span> {formatBytesPerSec(iface.rxSpeed)}
                     </span>
+                    {w && (
+                      <span className="w-full font-tabular text-[11px] text-muted">
+                        Wi-Fi {w.ssid ?? "not connected"}
+                        {w.signalDbm != null && <> · <span className={sigCls}>{w.signalDbm} dBm</span></>}
+                        {(w.txMbps != null || w.rxMbps != null) && <> · ↑{w.txMbps ?? "–"} ↓{w.rxMbps ?? "–"} Mbit/s</>}
+                      </span>
+                    )}
                   </div>
                 );
               })

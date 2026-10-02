@@ -13,6 +13,9 @@ import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
 import { VideoPanel } from "./VideoPanel";
+import { MemoryPanel } from "./MemoryPanel";
+import { HostHealthPanel } from "./HostHealthPanel";
+import { HistoryPanel } from "./HistoryPanel";
 import { ChevronDownIcon, ColumnsIcon, RowsIcon } from "../ui/icons";
 
 interface SparkPageProps {
@@ -287,6 +290,13 @@ export function SparkPage({
                 sparkId={spark.id}
                 temperatureUnit={temperatureUnit}
               />
+              {spark.kind !== "host" && (
+                <MemoryPanel
+                  sparkId={spark.id}
+                  memory={metrics.unifiedMemory}
+                  hostHealth={metrics.hostHealth}
+                />
+              )}
               {/* grow: fill the gap so the left column's bottom aligns with the right */}
               <CpuPanel
                 cpu={metrics.cpu}
@@ -306,6 +316,7 @@ export function SparkPage({
                 storagePollDisabled={storagePollDisabled}
                 onStoragePollModeChange={handleStoragePollModeChange}
               />
+              <HostHealthPanel health={metrics.hostHealth} />
               {/* grow: the right column's bottom panel fills the gap (Network, or
                   Tailnet when it's the last one) so both columns end at the same height */}
               <NetworkPanel
@@ -313,12 +324,18 @@ export function SparkPage({
                 sparkId={spark.id}
                 disabledInterfaces={disabledInterfaces}
                 onDisabledChange={setDisabledInterfaces}
+                wifi={metrics.hostHealth?.wifi}
                 className={tailscaleOn ? undefined : "grow"}
               />
               {tailscaleOn && (
                 <TailscalePanel tailscale={metrics.tailscale ?? null} className="grow" />
               )}
             </div>
+          </div>
+        )}
+        {resourcesOpen && (
+          <div className="md:col-span-2">
+            <HistoryPanel sparkId={spark.id} llmPorts={llmOn ? llmPorts : []} />
           </div>
         )}
         {/*
@@ -363,6 +380,7 @@ export function SparkPage({
             {videoOn && metrics.video && (
               <VideoPanel
                 video={metrics.video}
+                sparkId={spark.id}
                 className={spansFullWidth(videoCardIndex) ? "md:col-span-2" : undefined}
               />
             )}

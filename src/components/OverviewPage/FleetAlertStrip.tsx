@@ -11,6 +11,8 @@ function derive(sparks: SparkSnapshot[]): Alert[] {
     if (spark.metrics.storage.some((disk) => disk.percentage >= 90)) alerts.push({ key: `${spark.id}:disk`, spark, label: "Storage at or above 90%", severity: "warning" });
     if (spark.llmMonitoring !== false && spark.metrics.llm.length > 0 && spark.metrics.llm.every((llm) => !llm.available)) alerts.push({ key: `${spark.id}:llm`, spark, label: "LLM unavailable", severity: "warning" });
     if (spark.tailscaleMonitoring && spark.metrics.tailscale && (!spark.metrics.tailscale.available || spark.metrics.tailscale.online === false)) alerts.push({ key: `${spark.id}:tailnet`, spark, label: "Tailnet unavailable", severity: "warning" });
+    const hh = spark.metrics.hostHealth;
+    if (hh && (hh.level === "warn" || hh.level === "crit")) alerts.push({ key: `${spark.id}:host`, spark, label: `Host health: ${hh.reasons[0] ?? hh.level}`, severity: hh.level === "crit" ? "critical" : "warning" });
   }
   return alerts;
 }

@@ -145,3 +145,147 @@ export function pickNewestEngine(candidates) {
   }
   return best;
 }
+
+const EVENT_CAP = 30;
+
+/**
+ * Diff one /running poll against the previous one. `prev` is the state this
+ * function returned last time (null on the first poll: seed, emit nothing).
+ * @param {Map<string, {kind: "loading"|"ready"|"stopping", loadingAt: number|null}> | null} prev
+ * @param {RunningRow[]} rows
+ * @param {number} now
+ * @param {Array<{at: number, model: string, state: "loading"|"ready"|"stopped", loadMs: number|null}>} events newest first
+ * @returns {{ state: Map<string, {kind: "loading"|"ready"|"stopping", loadingAt: number|null}>, events: typeof events }}
+ */
+export function diffRouterRows(prev, rows, now, events) {
+  const state = new Map();
+  const fresh = [];
+  for (const r of rows) {
+    if (state.has(r.model)) continue;
+    const kind = isLoadingState(r.state) ? "loading" : isReadyState(r.state) ? "ready" : "stopping";
+    const was = prev?.get(r.model);
+    let loadingAt = kind === "loading" ? (was?.kind === "loading" ? was.loadingAt : null) : null;
+    if (prev) {
+      if (kind === "loading" && was?.kind !== "loading") {
+        loadingAt = now;
+        fresh.push({ at: now, model: r.model, state: "loading", loadMs: null });
+      } else if (kind === "ready" && was?.kind !== "ready") {
+        const loadMs = was?.kind === "loading" && was.loadingAt != null ? now - was.loadingAt : null;
+        fresh.push({ at: now, model: r.model, state: "ready", loadMs });
+      } else if (kind === "stopping" && was && was.kind !== "stopping") {
+        fresh.push({ at: now, model: r.model, state: "stopped", loadMs: null });
+      }
+    }
+    state.set(r.model, { kind, loadingAt });
+  }
+  if (prev) {
+    for (const [model, was] of prev) {
+      if (!state.has(model) && was.kind !== "stopping") {
+        fresh.push({ at: now, model, state: "stopped", loadMs: null });
+      }
+    }
+  }
+  return { state, events: [...fresh.reverse(), ...events].slice(0, EVENT_CAP) };
+}
+
+const HOUR_MS = 3_600_000;
+const ERROR_ROWS = 5;
+const MAX_TEXT = 200;
+
+/** @param {unknown} v */
+function shortText(v) {
+  return typeof v === "string" && v ? v.slice(0, MAX_TEXT) : null;
+}
+
+/**
+ * Request outcomes from one /api/metrics/activity page (statelessly).
+ * Returns null when the payload is not llama-swap's shape.
+ * @param {unknown} payload
+ * @param {number} now
+ */
+export function buildRouterActivity(payload, now) {
+  const data = payload && typeof payload === "object" ? payload.data : null;
+  if (!Array.isArray(data)) return null;
+  const cur = new Date(now);
+  cur.setMinutes(0, 0, 0);
+  const curStart = cur.getTime();
+  const oldest = curStart - 23 * HOUR_MS;
+  const hourly = [];
+  for (let i = 0; i < 24; i++) hourly.push({ hourStart: oldest + i * HOUR_MS, ok: 0, rejected: 0, failed: 0 });
+  const lastHour = { ok: 0, rejected: 0, failed: 0 };
+  const errors = [];
+  for (const row of data) {
+    if (!row || typeof row !== "object") continue;
+    const at = Date.parse(row.timestamp);
+    const status = Number(row.resp_status_code);
+    if (!Number.isFinite(at) || !Number.isFinite(status) || status < 100) continue;
+    const idx = Math.floor((at - oldest) / HOUR_MS);
+    if (idx < 0 || idx > 23) continue;
+    const field = status === 429 ? "rejected" : status >= 400 ? "failed" : "ok";
+    hourly[idx][field] += 1;
+    if (at >= now - HOUR_MS) lastHour[field] += 1;
+    if (status >= 400) {
+      errors.push({
+        at,
+        model: shortText(row.model) ?? "",
+        status,
+        message: shortText(row.error_msg),
+        src: shortText(row.src),
+      });
+    }
+  }
+  errors.sort((a, b) => b.at - a.at);
+  return { hourly, lastHour, recentErrors: errors.slice(0, ERROR_ROWS), updatedAt: now };
+}
+
+const MAX_MODELS = 200;
+
+/**
+ * Configured llama-swap models from /v1/models: aliases and foreign owners out.
+ * Returns null when the payload has no model list.
+ * @param {unknown} payload
+ * @returns {Array<{id: string, name: string|null, loaded: boolean}> | null}
+ */
+export function parseRouterModels(payload) {
+  const data = payload && typeof payload === "object" ? payload.data : null;
+  if (!Array.isArray(data)) return null;
+  const out = [];
+  for (const m of data) {
+    if (!m || typeof m !== "object" || !isSwapOwner(m.owned_by)) continue;
+    if (m.meta?.llamaswap?.type === "alias") continue;
+    const id = boundedString(m.id);
+    if (!id) continue;
+    out.push({ id, name: boundedString(m.name), loaded: m.status?.value === "loaded" });
+    if (out.length >= MAX_MODELS) break;
+  }
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/**
+ * Cumulative prompt (prefill) tokens from a Prometheus body, summed over all
+ * label sets. null when no known series is present.
+ * @param {string} txt
+ * @returns {number | null}
+ */
+export function promptTokensFromMetrics(txt) {
+  for (const name of [
+    "vllm:prompt_tokens_total",
+    "sglang:prompt_tokens_total",
+    "sglang_prompt_tokens_total",
+    "llamacpp:prompt_tokens_total",
+  ]) {
+    const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)\\s*$`, "gm");
+    let sum = 0;
+    let found = false;
+    let m;
+    while ((m = re.exec(txt)) !== null) {
+      const v = parseFloat(m[1]);
+      if (Number.isFinite(v)) {
+        sum += v;
+        found = true;
+      }
+    }
+    if (found) return sum;
+  }
+  return null;
+}

@@ -9,6 +9,7 @@ import { ComfyProbe } from "../collectors/ComfyProbe.js";
 import { VideoStudioProbe } from "../collectors/VideoStudioProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
+import { HostHealthProbe } from "../collectors/HostHealthProbe.js";
 import { llmDaily } from "../collectors/LlmDaily.js";
 import { llmHourly } from "../collectors/LlmHourly.js";
 import { sshExec } from "../collectors/ssh.js";
@@ -20,6 +21,7 @@ import {
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
   POLL_INTERVAL_VIDEO,
+  POLL_INTERVAL_HOST_HEALTH,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
   POLL_INTERVAL_HERMES,
@@ -77,6 +79,9 @@ export class SparkMonitor {
       ? new TailscaleProbe(spark)
       : null;
 
+    // Host health (PSI, NVMe, AER, Xid, units, containers, Wi-Fi): always on, one script per poll.
+    this.hostHealthProbe = new HostHealthProbe(spark);
+
     /** @type {HermesProbe | null} */
     this.hermesProbe = this._hermesMonitoringEnabled(spark)
       ? new HermesProbe(spark)
@@ -100,6 +105,9 @@ export class SparkMonitor {
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
     this.lastOnlineOk = 0;
+    // Set once a liveness check has run for the current run; until then `online` is just
+    // its initial value and domains must still poll.
+    this._onlineChecked = false;
 
     // System uptime seconds (from /proc/uptime), null when offline
     this._uptimeSeconds = null;
@@ -116,6 +124,7 @@ export class SparkMonitor {
       comfy: null,
       video: null,
       tailscale: null,
+      hostHealth: null,
     };
     this._lastUpdate = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
@@ -162,6 +171,7 @@ export class SparkMonitor {
     this._runGeneration += 1;
     this._inflight = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
+    this._onlineChecked = false;
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -214,6 +224,8 @@ export class SparkMonitor {
       this.videoProbe = null;
       this._metrics.video = null;
     }
+
+    this.hostHealthProbe.setTarget(spark);
 
     // Tailscale probe — create / update / clear
     if (this._tailscaleMonitoringEnabled()) {
@@ -444,6 +456,7 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
     this._intervals.push(setInterval(() => this._pollDomain("video"), POLL_INTERVAL_VIDEO));
+    this._intervals.push(setInterval(() => this._pollDomain("hostHealth"), POLL_INTERVAL_HOST_HEALTH));
     this._restartComfyPollInterval();
     this._restartHermesPollInterval();
     this._restartTailscalePollInterval();
@@ -480,6 +493,7 @@ export class SparkMonitor {
         /* ignore */
       }
     }
+    this.hostHealthProbe.dispose();
     console.log(`[SparkMonitor] ${this.spark.id} stopped`);
   }
 
@@ -536,6 +550,7 @@ export class SparkMonitor {
         llm: this._metrics.llm,
         comfy: comfyOn ? this._metrics.comfy : null,
         video: this._metrics.video ?? undefined,
+        hostHealth: this._metrics.hostHealth,
         tailscale: tailscaleOn ? this._metrics.tailscale : null,
       },
     };
@@ -596,6 +611,7 @@ export class SparkMonitor {
         this.online = false;
         this._uptimeSeconds = null;
       }
+      this._onlineChecked = true;
     } finally {
       if (this._inflight.online === checkToken) {
         this._inflight.online = false;
@@ -617,6 +633,7 @@ export class SparkMonitor {
       this._pollDomain("llm"),
       this._pollDomain("comfy"),
       this._pollDomain("video"),
+      this._pollDomain("hostHealth"),
       this._pollDomain("hermes"),
       this._pollDomain("tailscale"),
     ]);
@@ -624,6 +641,9 @@ export class SparkMonitor {
 
   async _pollDomain(domain) {
     if (!this._running || this._inflight[domain]) return;
+    // Offline hosts: skip every domain (liveness keeps running via _checkOnline, which
+    // flips `online` back and so resumes polling on the next tick).
+    if (this._onlineChecked && this.online === false) return;
     // Skip storage auto-poll when disabled for this spark
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API
@@ -667,6 +687,9 @@ export class SparkMonitor {
           break;
         case "video":
           result = this.videoProbe ? await this.videoProbe.probe() : null;
+          break;
+        case "hostHealth":
+          result = await this.hostHealthProbe.probe();
           break;
         case "tailscale":
           result = this.tailscaleProbe ? await this.tailscaleProbe.probe() : null;
@@ -727,6 +750,9 @@ export class SparkMonitor {
           break;
         case "video":
           this._metrics.video = result;
+          break;
+        case "hostHealth":
+          this._metrics.hostHealth = result;
           break;
         case "tailscale":
           this._metrics.tailscale = result;

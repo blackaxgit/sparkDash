@@ -304,6 +304,8 @@ export interface VideoMetrics {
 }
 
 export interface GpuMetrics {
+  /** false when the GPU collection failed or has not run yet: the values below are placeholders. */
+  collected?: boolean;
   temperature: number;
   usage: number;
   power: {
@@ -372,8 +374,9 @@ export interface StorageMetrics {
   total: number;
   available: number;
   percentage: number;
-  readSpeed: number;
-  writeSpeed: number;
+  /** Bytes/s. null when the collector cannot measure it (remote sparks). */
+  readSpeed: number | null;
+  writeSpeed: number | null;
   /** Present when device is in disabledDevices; still returned for Settings UI */
   disabled?: boolean;
 }
@@ -426,6 +429,44 @@ export interface LlmRouterEngine {
   totalOutputTokens: number;
   /** True for the engine the rest of the card describes. */
   active: boolean;
+  /** Live prompt (prefill) rate of this engine (tok/s); 0 when idle. Shows embedders' work. */
+  promptTps?: number;
+}
+
+/** A llama-swap model state change seen between two `/running` polls. */
+export interface LlmRouterEvent {
+  at: number;
+  model: string;
+  state: "loading" | "ready" | "stopped";
+  /** ready only: ms from the first `loading` sighting to `ready`; null when the load was not observed. */
+  loadMs: number | null;
+}
+
+export interface LlmRouterRequestCounts {
+  /** 1xx–3xx responses. */
+  ok: number;
+  /** HTTP 429 — shed by llama-swap's concurrency queue (e.g. while a studio holds the GPU). */
+  rejected: number;
+  /** Any other status ≥ 400. */
+  failed: number;
+}
+
+/** Request outcomes from llama-swap's own activity log (`/api/metrics/activity`). */
+export interface LlmRouterActivity {
+  /** 24 hourly buckets, oldest first; the last one is the current hour. */
+  hourly: (LlmRouterRequestCounts & { hourStart: number })[];
+  /** Rolling last 60 minutes. */
+  lastHour: LlmRouterRequestCounts;
+  /** Newest first, at most 5. */
+  recentErrors: { at: number; model: string; status: number; message: string | null; src: string | null }[];
+  updatedAt: number;
+}
+
+/** A model configured in llama-swap (aliases excluded). */
+export interface LlmRouterModel {
+  id: string;
+  name: string | null;
+  loaded: boolean;
 }
 
 // ─── LLM metrics ─────────────────────────────────────────
@@ -486,6 +527,12 @@ export interface LlmMetrics {
    * Each engine counts its own tokens from its own start.
    */
   routerEngines?: LlmRouterEngine[];
+  /** Model state changes behind the router, newest first, at most 30. In memory only. */
+  routerEvents?: LlmRouterEvent[];
+  /** Request outcomes over the last 24 h; null until the first activity read succeeds. */
+  routerActivity?: LlmRouterActivity | null;
+  /** Configured models (aliases excluded), sorted by id. */
+  routerModels?: LlmRouterModel[];
   /** Engine identity (`model@processStart`); changes on every swap/restart. */
   engineId?: string | null;
   /**
@@ -650,6 +697,54 @@ export interface SparkMetrics {
   tailscale?: TailscaleMetrics | null;
   /** Video-studio (ComfyUI behind llama-swap) state; absent when the LLM endpoint is not a llama-swap router. */
   video?: VideoMetrics;
+  /** Host health (pressure, NVMe, PCIe, kernel GPU errors, units, containers, Wi-Fi); absent until first poll. */
+  hostHealth?: HostHealthMetrics | null;
+}
+
+export interface PsiStat {
+  someAvg10: number;
+  someAvg60: number;
+  /** null for /proc/pressure/cpu on kernels that do not report `full`. */
+  fullAvg60: number | null;
+}
+
+export interface HostHealthMetrics {
+  available: boolean;
+  level: "ok" | "warn" | "crit";
+  /** Human-readable causes of a warn/crit level, most severe first. */
+  reasons: string[];
+  psi: { cpu: PsiStat | null; memory: PsiStat | null; io: PsiStat | null };
+  load: [number, number, number] | null;
+  swap: { totalMb: number; usedMb: number } | null;
+  nvme: {
+    device: string;
+    tempC: number | null;
+    percentUsed: number | null;
+    writtenTB: number | null;
+    unsafeShutdowns: number | null;
+    mediaErrors: number | null;
+    criticalWarning: number | null;
+    powerOnHours: number | null;
+  } | null;
+  /** PCIe AER error totals since boot, summed over devices. */
+  pcieAer: { correctable: number; nonFatal: number; fatal: number } | null;
+  /** `NVRM: Xid` kernel lines in the last 24 h. */
+  xid24h: number | null;
+  lastXid: string | null;
+  failedUnits: string[];
+  containers: { name: string; state: string; status: string }[];
+  wifi: { iface: string; ssid: string | null; signalDbm: number | null; txMbps: number | null; rxMbps: number | null }[];
+  updatedAt: number;
+  error?: string;
+}
+
+/** GET /api/sparks/:id/history — long-term downsampled series. */
+export type HistoryRange = "1h" | "24h" | "7d";
+export interface HistoryResponse {
+  range: HistoryRange;
+  stepMs: number;
+  /** key (e.g. "gpu.usage", "llm:11434.tps") → [timestampMs, value|null] oldest first. */
+  series: Record<string, [number, number | null][]>;
 }
 
 // ─── Spark snapshot (server pushes this) ──────────────────

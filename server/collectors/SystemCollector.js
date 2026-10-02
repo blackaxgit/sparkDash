@@ -106,7 +106,9 @@ export class SystemCollector {
       } catch (err) {
         console.error(`[SystemCollector] Thermal error for ${this.spark.id}:`, err.message);
       }
-      return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
+      const collected = this._isSuccessfulGpuCollection(gpuData);
+      gpuData.collected = collected;
+      return tagCollectionResult(gpuData, collected);
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
       return tagCollectionResult(this._defaultGpu(), false);
@@ -1523,8 +1525,8 @@ export class SystemCollector {
           total: Math.round(parseInt(size) / 1024 / 1024),
           available: Math.round(parseInt(avail) / 1024 / 1024),
           percentage: parseInt(pct) || 0,
-          readSpeed: 0,
-          writeSpeed: 0,
+          readSpeed: null,
+          writeSpeed: null,
           disabled: isDisabled,
         });
       }
@@ -1949,6 +1951,7 @@ export class SystemCollector {
   // ─── Default metrics ─────────────────────────────────────
   _defaultGpu() {
     return {
+      collected: false,
       temperature: 0,
       usage: 0,
       power: { draw: 0, limit: 120, systemDraw: 0 },

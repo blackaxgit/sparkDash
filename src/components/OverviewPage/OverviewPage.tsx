@@ -9,6 +9,8 @@ import { FleetAlertStrip } from "./FleetAlertStrip";
 import { FleetTokenTotals } from "./FleetTokenTotals";
 import { ActivityIcon, PowerOffIcon, PowerOnIcon, RotateIcon } from "../ui/icons";
 import { formatMb } from "../../shared/formatBytes";
+import { Sparkline } from "../ui/Sparkline";
+import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 
 interface OverviewPageProps {
   sparks: SparkSnapshot[];
@@ -94,6 +96,8 @@ function SparkCard({
   const gpu = spark.metrics.gpu;
   const um = spark.metrics.unifiedMemory;
   const online = spark.online;
+  const gpuUsageHistory = useMetricsHistoryTail(spark.id, "gpu.usage");
+  const gpuTempHistory = useMetricsHistoryTail(spark.id, "gpu.temp");
 
   const usage = gpu?.usage ?? 0;
   const tempRaw = gpu?.temperature ?? 0;
@@ -318,6 +322,32 @@ function SparkCard({
               color={usageBarColor}
               caption={`${usage}%`}
             />
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="text-[10px] tracking-wide text-muted">GPU %</span>
+              <div className="min-w-0 flex-1">
+                <Sparkline
+                  data={gpuUsageHistory}
+                  height={16}
+                  stretch
+                  unit="%"
+                  ariaLabel="GPU usage history"
+                />
+              </div>
+            </div>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="text-[10px] tracking-wide text-muted">Temp</span>
+              <div className="min-w-0 flex-1">
+                <Sparkline
+                  data={gpuTempHistory}
+                  height={16}
+                  stretch
+                  unit="°C"
+                  ariaLabel="GPU temperature history (°C)"
+                />
+              </div>
+            </div>
           </div>
 
           {/* Secondary stats */}

@@ -47,6 +47,8 @@ const POLL_INTERVAL_LLM = parseInt(process.env.POLL_INTERVAL_LLM || "2000", 10);
 const POLL_INTERVAL_COMFY = parseInt(process.env.POLL_INTERVAL_COMFY || "2000", 10);
 // Video studio (ComfyUI behind llama-swap) queue/progress; local HTTP only, no SSH.
 const POLL_INTERVAL_VIDEO = parseInt(process.env.POLL_INTERVAL_VIDEO || "3000", 10);
+// Host health (PSI, NVMe SMART, PCIe AER, Xid, failed units, containers, Wi-Fi): one SSH round-trip.
+const POLL_INTERVAL_HOST_HEALTH = parseInt(process.env.POLL_INTERVAL_HOST_HEALTH || "60000", 10);
 // Tailnet membership changes slowly; each poll is an SSH round-trip.
 const POLL_INTERVAL_TAILSCALE = parseInt(process.env.POLL_INTERVAL_TAILSCALE || "30000", 10);
 // Kernel journal scan for NV_ERR_NO_MEMORY — not on the 2s GPU loop.
@@ -127,6 +129,7 @@ export {
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
   POLL_INTERVAL_VIDEO,
+  POLL_INTERVAL_HOST_HEALTH,
   POLL_INTERVAL_TAILSCALE,
   POLL_INTERVAL_NVERR,
   POLL_INTERVAL_BANDWIDTH,

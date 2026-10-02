@@ -114,14 +114,14 @@ function GpuDeviceRow({
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted">Usage</span>
         <div className="flex items-center gap-2">
-          <Sparkline data={usageHistory} color="var(--color-accent)" width={84} height={16} />
+          <Sparkline data={usageHistory} color="var(--color-accent)" width={84} height={16} unit="%" />
           <span className="font-tabular text-text">{d.usage}%</span>
         </div>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted">Temperature</span>
         <div className="flex items-center gap-2">
-          <Sparkline data={tempHistory} color={tempColor} width={84} height={16} />
+          <Sparkline data={tempHistory} color={tempColor} width={84} height={16} unit="°C" />
           <span className="font-tabular" style={{ color: tempColor }}>{tempLabel}</span>
         </div>
       </div>
@@ -166,6 +166,8 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
   const vramPct = gpu?.vram?.percentage ?? 0;
   const devices = gpu?.gpus ?? [];
   const multiGpu = devices.length > 1;
+  /** No data yet, or the server marked the collection failed: the numbers are placeholder zeros. */
+  const unavailable = !gpu || gpu.collected === false;
 
   const tempColor =
     temperature > 85
@@ -225,14 +227,14 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       <MetricRow
         label="Usage"
         color="var(--color-accent)"
-        spark={<Sparkline data={usageHistory} color="var(--color-accent)" width={180} />}
-        value={<span className="text-text-strong">{usage}%</span>}
+        spark={<Sparkline data={usageHistory} color="var(--color-accent)" width={180} unit="%" />}
+        value={<span className="text-text-strong">{unavailable ? "—" : `${usage}%`}</span>}
       />
       <MetricRow
         label="Temperature"
         color={tempColor}
-        spark={<Sparkline data={tempHistory} color={tempColor} width={180} />}
-        value={<span className="text-text-strong">{tempLabel}</span>}
+        spark={<Sparkline data={tempHistory} color={tempColor} width={180} unit="°C" />}
+        value={<span className="text-text-strong">{unavailable ? "—" : tempLabel}</span>}
       />
       {thermal && thermal.level !== "unknown" && (
         <div className="space-y-1 border-t border-border pt-3">
@@ -270,7 +272,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       <div className="flex justify-between text-sm">
         <span className="text-muted">{multiGpu ? "GPU Power (all cards)" : "GPU Power"}</span>
         <span className="font-tabular text-sm text-text">
-          {powerDraw}W / {powerLimit}W
+          {unavailable ? "—" : `${powerDraw}W / ${powerLimit}W`}
         </span>
       </div>
 
@@ -351,7 +353,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       {/* GPU-allocated memory (portion of the unified pool held by GPU compute apps) */}
       {gpu && (
         <div className="space-y-2 border-t border-border pt-3">
-          {vramTotal > 0 ? (
+          {!unavailable && vramTotal > 0 ? (
             <>
               <MetricBar
                 label={multiGpu ? "VRAM (all cards)" : "VRAM"}
@@ -370,7 +372,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
             <div className="flex justify-between text-xs">
               <span className="text-muted">VRAM</span>
               <span className="font-tabular text-text">
-                {vramUsed > 0 ? `${formatMb(vramUsed)} used` : "—"}
+                {!unavailable && vramUsed > 0 ? `${formatMb(vramUsed)} used` : "—"}
               </span>
             </div>
           )}

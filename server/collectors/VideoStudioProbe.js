@@ -9,8 +9,9 @@
  * SAFETY (see comfyDetect.js): the only llama-swap endpoints used are `GET /running` and
  * `GET /api/events` (SSE, read once then aborted). Studio traffic goes straight to the
  * upstream origin from /running (`upstreamBase`), never through llama-swap's
- * /upstream/<model>/ path, and nothing is ever POSTed. Request headers and remote IPs from
- * /api/events are never read into the snapshot.
+ * /upstream/<model>/ path. This probe never POSTs anything: cancelling or removing a job
+ * goes through comfyActions from the server route, guarded by studioPort() / hasJob().
+ * Request headers and remote IPs from /api/events are never read into the snapshot.
  *
  * Progress is an ESTIMATE: ComfyUI only sends step progress to the submitting client_id, so
  * elapsed time is compared with the median duration of recent successful renders.
@@ -441,6 +442,8 @@ export class VideoStudioProbe {
     this._pending = [];
     this._llmWait = null;
     this._llmWaitAt = 0;
+    /** @type {"ready" | "loading" | "unloaded" | null} state reported by the last probe */
+    this._studioState = null;
   }
 
   /** @param {object} spark */
@@ -449,6 +452,27 @@ export class VideoStudioProbe {
     this.spark = spark ?? this.spark;
     if (llmProbeHost(this.spark) !== prevHost) this._reset();
     else this._port = null;
+  }
+
+  /**
+   * Port of the resident studio, only while it is resident and ready (the last probe
+   * saw it ready); null when it is loading, unloaded or unknown.
+   * @returns {number | null}
+   */
+  studioPort() {
+    return this._studioState === "ready" ? (this._lastStudio?.port ?? null) : null;
+  }
+
+  /**
+   * Where a prompt sits in the last snapshot's queue.
+   * @param {string} promptId
+   * @returns {"running" | "pending" | null}
+   */
+  hasJob(promptId) {
+    if (typeof promptId !== "string" || !promptId) return null;
+    if (this._active?.promptId === promptId) return "running";
+    if (this._pending.some((p) => p.promptId === promptId)) return "pending";
+    return null;
   }
 
   /** Abort any in-flight SSE read. */
@@ -706,6 +730,7 @@ export class VideoStudioProbe {
    * @param {{ reached: boolean, error?: string | null, studioState?: "ready" | "loading" | "unloaded" | null, now: number }} p
    */
   _snapshot({ reached, error, studioState, now }) {
+    this._studioState = studioState ?? null;
     const studio =
       this._lastStudio && studioState ? { ...this._lastStudio, state: studioState } : null;
     /** @type {Record<string, unknown>} */

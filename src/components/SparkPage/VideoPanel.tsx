@@ -1,3 +1,4 @@
+import { useCallback, useState } from "react";
 import type {
   VideoActiveJob,
   VideoHourBucket,
@@ -7,9 +8,11 @@ import type {
   VideoRecentJob,
 } from "../../api/types";
 import { Panel } from "../ui/Panel";
+import { cancelVideoJob } from "../../api/client";
 
 interface VideoPanelProps {
   video: VideoMetrics;
+  sparkId: string;
   className?: string;
 }
 
@@ -156,7 +159,18 @@ function EstimateBar({ percent }: { percent: number | null }) {
   );
 }
 
-function ActiveBlock({ job }: { job: VideoActiveJob }) {
+const JOB_BTN =
+  "shrink-0 rounded border border-danger/40 px-1.5 py-0.5 text-[11px] text-danger transition-colors hover:bg-danger/15 disabled:cursor-not-allowed disabled:opacity-50";
+
+function ActiveBlock({
+  job,
+  onCancel,
+  busy,
+}: {
+  job: VideoActiveJob;
+  onCancel: () => void;
+  busy: boolean;
+}) {
   const footprint: string[] = [];
   if (job.width != null && job.height != null) footprint.push(`${job.width}×${job.height}`);
   if (job.frames != null) footprint.push(`${job.frames} frames`);
@@ -178,6 +192,9 @@ function ActiveBlock({ job }: { job: VideoActiveJob }) {
         <span className="font-tabular text-[11px] text-muted" title={job.promptId}>
           {shortId(job.promptId)}
         </span>
+        <button type="button" className={`${JOB_BTN} ml-auto`} disabled={busy} onClick={onCancel}>
+          {busy ? "Cancelling…" : "Cancel"}
+        </button>
       </div>
       <ModelChips models={job.models} />
       {footprint.length > 0 ? (
@@ -310,7 +327,24 @@ function lastActivityTs(video: VideoMetrics): number | null {
   return null;
 }
 
-export function VideoPanel({ video, className = "" }: VideoPanelProps) {
+export function VideoPanel({ video, sparkId, className = "" }: VideoPanelProps) {
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const handleStop = useCallback(
+    async (promptId: string, question: string) => {
+      if (!confirm(question)) return;
+      setActionError(null);
+      setCancellingId(promptId);
+      try {
+        await cancelVideoJob(sparkId, promptId);
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setCancellingId(null);
+      }
+    },
+    [sparkId]
+  );
   const now = Date.now();
   const studio = video.studio;
   const unloaded = studio?.state === "unloaded";
@@ -381,6 +415,11 @@ export function VideoPanel({ video, className = "" }: VideoPanelProps) {
               ) : null}
             </div>
           ) : null}
+          {actionError ? (
+            <p className="break-words text-[11px] text-danger" role="alert">
+              {actionError}
+            </p>
+          ) : null}
 
           <div className={`space-y-3 ${unloaded ? "opacity-60" : ""}`}>
             {unloaded ? (
@@ -391,7 +430,16 @@ export function VideoPanel({ video, className = "" }: VideoPanelProps) {
                   : ""}
               </p>
             ) : video.active ? (
-              <ActiveBlock job={video.active} />
+              <ActiveBlock
+                job={video.active}
+                busy={cancellingId !== null}
+                onCancel={() =>
+                  void handleStop(
+                    video.active!.promptId,
+                    "Stop this render? The frames rendered so far are lost."
+                  )
+                }
+              />
             ) : (
               <div className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted">
                 Idle
@@ -420,6 +468,16 @@ export function VideoPanel({ video, className = "" }: VideoPanelProps) {
                     <span className="shrink-0 font-tabular text-muted">
                       {p.queuedAt != null ? `queued ${formatAgo(p.queuedAt, now)}` : "queued"}
                     </span>
+                    <button
+                      type="button"
+                      className={JOB_BTN}
+                      disabled={cancellingId !== null}
+                      onClick={() =>
+                        void handleStop(p.promptId, "Remove this job from the studio queue?")
+                      }
+                    >
+                      {cancellingId === p.promptId ? "Removing…" : "Remove"}
+                    </button>
                   </div>
                 ))}
                 {video.queuePending > Math.min(PENDING_ROWS, video.pending.length) ? (
