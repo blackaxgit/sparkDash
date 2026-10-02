@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type CSSProperties } from "react";
+import { useState, useEffect, useCallback, type CSSProperties, type ReactNode } from "react";
 import type { SparkSnapshot } from "../../api/types";
 import { isLlmMonitoringEnabled } from "../../api/sparkRole";
 import { updateSpark, refreshSparkMetric, addLlmPort, removeLlmPort } from "../../api/client";
@@ -12,13 +12,20 @@ import { NetworkPanel } from "./NetworkPanel";
 import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
-import { ChevronDownIcon } from "../ui/icons";
+import { VideoPanel } from "./VideoPanel";
+import { MemoryPanel } from "./MemoryPanel";
+import { HostHealthPanel } from "./HostHealthPanel";
+import { HistoryPanel } from "./HistoryPanel";
+import { ChevronDownIcon, ColumnsIcon, RowsIcon } from "../ui/icons";
 
 interface SparkPageProps {
   spark: SparkSnapshot;
   temperatureUnit: "celsius" | "fahrenheit";
   /** Show "Copy image" in the benchmark dialogs (Settings, off by default). */
   benchShareImage?: boolean;
+  /** Persisted server-side, so the choice follows the user across browsers. */
+  servicesLayout?: "grid" | "rows";
+  onServicesLayoutChange?: (next: "grid" | "rows") => void;
   onEdit?: () => void;
 }
 
@@ -52,30 +59,32 @@ function SectionHeading({
   open,
   onToggle,
   style,
+  actions,
 }: {
   title: string;
   open: boolean;
   onToggle: () => void;
   style?: CSSProperties;
+  actions?: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={open}
-      className="md:col-span-2 flex w-full items-center gap-2 text-left font-normal leading-tight tracking-tight text-text-strong transition-colors hover:text-accent"
-      style={{
-        fontSize: "var(--density-overview-title)",
-        ...style,
-      }}
-    >
-      <ChevronDownIcon
-        className={`h-5 w-5 shrink-0 text-muted transition-transform duration-150 ${
-          open ? "" : "-rotate-90"
-        }`}
-      />
-      <span>{title}</span>
-    </button>
+    <div className="md:col-span-2 flex w-full items-center gap-2" style={style}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex flex-1 items-center gap-2 text-left font-normal leading-tight tracking-tight text-text-strong transition-colors hover:text-accent"
+        style={{ fontSize: "var(--density-overview-title)" }}
+      >
+        <ChevronDownIcon
+          className={`h-5 w-5 shrink-0 text-muted transition-transform duration-150 ${
+            open ? "" : "-rotate-90"
+          }`}
+        />
+        <span>{title}</span>
+      </button>
+      {actions}
+    </div>
   );
 }
 
@@ -83,6 +92,8 @@ export function SparkPage({
   spark,
   temperatureUnit,
   benchShareImage = false,
+  servicesLayout = "grid",
+  onServicesLayoutChange,
   onEdit,
 }: SparkPageProps) {
   const { metrics } = spark;
@@ -185,22 +196,49 @@ export function SparkPage({
   const llmOn = isLlmMonitoringEnabled(spark);
   const comfyOn = Boolean(spark.comfyMonitoring);
   const tailscaleOn = Boolean(spark.tailscaleMonitoring);
-  /** First LLM + Comfy share a row when both are on. */
-  const primarySideBySide = llmOn && comfyOn;
-  const showServices = llmOn || comfyOn;
+  const videoOn = Boolean(metrics.video?.available);
+  const showServices = llmOn || comfyOn || videoOn;
   const primaryPort = llmPorts[0];
   const extraPorts = llmPorts.slice(1);
 
   /**
-   * Extra LLM ports (after the primary):
-   * - 1 extra → full-width own row
-   * - 2+ extras → 2-column pairs; if odd count, last one full-width alone
+   * Service cards flow through a 2-column grid in render order: every LLM port,
+   * then ComfyUI. They pair up half-and-half; only a trailing odd card spans
+   * both columns so it doesn't sit alone at half width.
    */
-  const extraLlmFullWidth = (extraIndex: number, extraCount: number) => {
-    if (extraCount === 1) return true;
-    if (extraCount % 2 === 1 && extraIndex === extraCount - 1) return true;
-    return false;
-  };
+  const serviceCardCount = (llmOn ? llmPorts.length : 0) + (comfyOn ? 1 : 0) + (videoOn ? 1 : 0);
+  const spansFullWidth = (index: number) =>
+    servicesLayout === "rows" ||
+    (serviceCardCount % 2 === 1 && index === serviceCardCount - 1);
+  const comfyCardIndex = llmOn ? llmPorts.length : 0;
+  const videoCardIndex = comfyCardIndex + (comfyOn ? 1 : 0);
+
+  /** Both layouts look identical with a single card, so only offer the choice above one. */
+  const servicesLayoutToggle =
+    serviceCardCount > 1 && onServicesLayoutChange ? (
+      <div className="flex items-center gap-0.5" role="group" aria-label="Services layout">
+        {([
+          ["grid", ColumnsIcon, "Side-by-side"],
+          ["rows", RowsIcon, "Stacked rows"],
+        ] as const).map(([mode, Icon, label]) => (
+          <button
+            key={mode}
+            type="button"
+            onClick={() => onServicesLayoutChange(mode)}
+            aria-pressed={servicesLayout === mode}
+            aria-label={label}
+            title={label}
+            className={`rounded p-1 transition-colors ${
+              servicesLayout === mode
+                ? "text-accent"
+                : "text-muted hover:text-text-strong"
+            }`}
+          >
+            <Icon className="h-4 w-4" />
+          </button>
+        ))}
+      </div>
+    ) : null;
 
   const renderLlmPanel = (port: number, portIndex: number, className?: string) => {
     const llmMetrics = metrics.llm?.[portIndex] ?? null;
@@ -217,6 +255,7 @@ export function SparkPage({
         shareImage={benchShareImage}
         onRemovePort={canRemove ? handleRemovePort : undefined}
         className={className}
+        llmWait={metrics.video?.llmWait ?? null}
       />
     );
   };
@@ -251,6 +290,13 @@ export function SparkPage({
                 sparkId={spark.id}
                 temperatureUnit={temperatureUnit}
               />
+              {spark.kind !== "host" && (
+                <MemoryPanel
+                  sparkId={spark.id}
+                  memory={metrics.unifiedMemory}
+                  hostHealth={metrics.hostHealth}
+                />
+              )}
               {/* grow: fill the gap so the left column's bottom aligns with the right */}
               <CpuPanel
                 cpu={metrics.cpu}
@@ -270,6 +316,7 @@ export function SparkPage({
                 storagePollDisabled={storagePollDisabled}
                 onStoragePollModeChange={handleStoragePollModeChange}
               />
+              <HostHealthPanel health={metrics.hostHealth} />
               {/* grow: the right column's bottom panel fills the gap (Network, or
                   Tailnet when it's the last one) so both columns end at the same height */}
               <NetworkPanel
@@ -277,6 +324,7 @@ export function SparkPage({
                 sparkId={spark.id}
                 disabledInterfaces={disabledInterfaces}
                 onDisabledChange={setDisabledInterfaces}
+                wifi={metrics.hostHealth?.wifi}
                 className={tailscaleOn ? undefined : "grow"}
               />
               {tailscaleOn && (
@@ -285,12 +333,18 @@ export function SparkPage({
             </div>
           </div>
         )}
+        {resourcesOpen && (
+          <div className="md:col-span-2">
+            <HistoryPanel
+              sparkId={spark.id}
+              llmPorts={llmOn ? llmPorts : []}
+              temperatureUnit={temperatureUnit}
+            />
+          </div>
+        )}
         {/*
-          Services layout:
-          - Primary LLM + ComfyUI → always same row, 2 columns (when both on)
-          - Alone → full width
-          - +1 LLM → own full-width row
-          - +2 LLMs → 2-column row; odd leftover → full-width row
+          Services layout: LLM ports then ComfyUI, filling a 2-column grid
+          50/50; a trailing odd card spans the full width.
         */}
         {showServices && (
           <SectionHeading
@@ -298,6 +352,7 @@ export function SparkPage({
             open={servicesOpen}
             onToggle={toggleServices}
             style={{ marginTop: "var(--density-page-gap)" }}
+            actions={servicesLayoutToggle}
           />
         )}
         {showServices && servicesOpen && (
@@ -307,7 +362,7 @@ export function SparkPage({
               renderLlmPanel(
                 primaryPort,
                 0,
-                primarySideBySide ? undefined : "md:col-span-2"
+                spansFullWidth(0) ? "md:col-span-2" : undefined
               )}
             {comfyOn && (
               <ComfyPanel
@@ -315,7 +370,7 @@ export function SparkPage({
                 comfyPort={spark.comfyPort ?? 8188}
                 sparkId={spark.id}
                 lanIp={spark.lanIp}
-                className={primarySideBySide ? undefined : "md:col-span-2"}
+                className={spansFullWidth(comfyCardIndex) ? "md:col-span-2" : undefined}
               />
             )}
             {llmOn &&
@@ -323,9 +378,16 @@ export function SparkPage({
                 renderLlmPanel(
                   port,
                   j + 1,
-                  extraLlmFullWidth(j, extraPorts.length) ? "md:col-span-2" : undefined
+                  spansFullWidth(j + 1) ? "md:col-span-2" : undefined
                 )
               )}
+            {videoOn && metrics.video && (
+              <VideoPanel
+                video={metrics.video}
+                sparkId={spark.id}
+                className={spansFullWidth(videoCardIndex) ? "md:col-span-2" : undefined}
+              />
+            )}
             {llmOn &&
               (showAddPort ? (
                 <div className="md:col-span-2 rounded-lg border border-border bg-surface p-3">

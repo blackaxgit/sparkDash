@@ -8,9 +8,11 @@
 import { execFile } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
+import path from "path";
 import {
   COMFY_PORT,
   COMFY_PROBE_TIMEOUT_MS,
+  HOST_PATHS,
   SSH_CONNECT_TIMEOUT,
   SSH_MULTIPLEX,
 } from "../config.js";
@@ -301,6 +303,28 @@ export async function sshExec(spark, cmd, options = {}) {
     invalidateMultiplex(multiplex);
     throw err;
   }
+}
+
+/**
+ * Run a command on the machine this process runs on. Inside Docker, where the
+ * host's /proc is mounted, enter the host mount namespace so host binaries and
+ * sockets (nvidia-smi, tailscaled) are visible; otherwise plain `sh -c`.
+ *
+ * @param {string} cmd
+ * @param {{ timeoutMs: number, maxBuffer?: number }} options
+ * @returns {Promise<string>} - Trimmed stdout
+ */
+export function execHostLocal(cmd, { timeoutMs, maxBuffer }) {
+  const mntNs = path.join(HOST_PATHS.PROC, "1", "ns", "mnt");
+  const useHostNs = fs.existsSync(mntNs);
+  const file = useHostNs ? "nsenter" : "sh";
+  const args = useHostNs ? [`--mount=${mntNs}`, "--", "sh", "-c", cmd] : ["-c", cmd];
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: timeoutMs, ...(maxBuffer ? { maxBuffer } : {}) }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(String(stderr || "").trim() || err.message));
+      resolve(String(stdout).trim());
+    });
+  });
 }
 
 /**

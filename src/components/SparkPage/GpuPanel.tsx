@@ -5,16 +5,13 @@ import { ActivityIcon } from "../ui/icons";
 import { MetricBar } from "../ui/MetricBar";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 import { formatMb } from "../../shared/formatBytes";
+import { celsiusToFahrenheit, tempFormatter } from "../../shared/temperature";
 
 interface GpuPanelProps {
   gpu: GpuMetrics | null;
   sparkId: string;
   temperatureUnit: "celsius" | "fahrenheit";
   className?: string;
-}
-
-function celsiusToFahrenheit(c: number): number {
-  return Math.round(c * 9 / 5 + 32);
 }
 
 /** "NVIDIA GeForce RTX 5080" → "RTX 5080" for the per-card rows. */
@@ -33,6 +30,26 @@ function throttleChip(reason: string | undefined): { label: string; className: s
         ? "border-warning/40 bg-warning/15 text-warning"
         : "border-border bg-surface-elevated text-muted";
   return { label, className };
+}
+
+/** Temperature DIFFERENCE: scale by 9/5 only, no +32 offset. */
+function formatHeadroom(c: number, unit: "celsius" | "fahrenheit"): string {
+  return unit === "fahrenheit" ? `${Math.round((c * 9) / 5)}°F` : `${Math.round(c)}°C`;
+}
+
+function formatZone(maxC: number, critC: number | null, unit: "celsius" | "fahrenheit"): string {
+  const conv = (c: number) => (unit === "fahrenheit" ? celsiusToFahrenheit(c) : Math.round(c));
+  const suffix = unit === "fahrenheit" ? "°F" : "°C";
+  return critC != null ? `${conv(maxC)} / ${conv(critC)}${suffix}` : `${conv(maxC)}${suffix}`;
+}
+
+/** Cumulative clock-event counter (microseconds) as s / min / h. */
+function formatMicros(us: number): string {
+  const s = us / 1_000_000;
+  if (s < 60) return `${Math.round(s)} s`;
+  const trim = (n: number) => n.toFixed(1).replace(/\.0$/, "");
+  if (s < 3600) return `${trim(s / 60)} min`;
+  return `${trim(s / 3600)} h`;
 }
 
 function MetricRow({
@@ -94,14 +111,20 @@ function GpuDeviceRow({
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted">Usage</span>
         <div className="flex items-center gap-2">
-          <Sparkline data={usageHistory} color="var(--color-accent)" width={84} height={16} />
+          <Sparkline data={usageHistory} color="var(--color-accent)" width={84} height={16} unit="%" />
           <span className="font-tabular text-text">{d.usage}%</span>
         </div>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted">Temperature</span>
         <div className="flex items-center gap-2">
-          <Sparkline data={tempHistory} color={tempColor} width={84} height={16} />
+          <Sparkline
+            data={tempHistory}
+            color={tempColor}
+            width={84}
+            height={16}
+            format={tempFormatter(temperatureUnit)}
+          />
           <span className="font-tabular" style={{ color: tempColor }}>{tempLabel}</span>
         </div>
       </div>
@@ -146,6 +169,8 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
   const vramPct = gpu?.vram?.percentage ?? 0;
   const devices = gpu?.gpus ?? [];
   const multiGpu = devices.length > 1;
+  /** No data yet, or the server marked the collection failed: the numbers are placeholder zeros. */
+  const unavailable = !gpu || gpu.collected === false;
 
   const tempColor =
     temperature > 85
@@ -153,6 +178,25 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       : temperature > 65
         ? "var(--color-warning)"
         : "var(--color-accent)";
+
+  const thermal = gpu?.thermal;
+  const tlimitC = thermal?.tlimitC ?? null;
+  const headroomClass =
+    thermal?.level === "crit"
+      ? "text-danger"
+      : (tlimitC != null && tlimitC <= 2) || thermal?.level === "warn"
+        ? "text-warning"
+        : "text-muted";
+  const slowdownParts: { label: string; us: number; recent: boolean }[] = [];
+  if (thermal?.hwSlowdownUs != null) {
+    slowdownParts.push({ label: "HW", us: thermal.hwSlowdownUs, recent: thermal.hwSlowdownRecent });
+  }
+  if (thermal?.swSlowdownUs != null) {
+    slowdownParts.push({ label: "SW", us: thermal.swSlowdownUs, recent: thermal.swSlowdownRecent });
+  }
+  if (thermal?.powerCapUs != null) {
+    slowdownParts.push({ label: "power-cap", us: thermal.powerCapUs, recent: false });
+  }
 
   return (
     <Panel
@@ -162,22 +206,83 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       className={`panel-gpu ${className ?? ""}`}
       bodyClassName="space-y-3"
     >
+      {thermal && (thermal.level === "warn" || thermal.level === "crit") && (
+        <div
+          role="alert"
+          className={`rounded border px-3 py-2 text-xs font-medium ${
+            thermal.level === "crit"
+              ? "border-danger/40 bg-danger/15 text-danger"
+              : "border-warning/40 bg-warning/15 text-warning"
+          }`}
+        >
+          <div className="uppercase tracking-wide">
+            {thermal.level === "crit" ? "Thermal critical" : "Thermal warning"}
+          </div>
+          {(thermal.reasons?.length ?? 0) > 0 && (
+            <ul className="mt-0.5 list-disc pl-4 font-normal">
+              {thermal.reasons.map((reason) => (
+                <li key={reason}>{reason}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       <MetricRow
         label="Usage"
         color="var(--color-accent)"
-        spark={<Sparkline data={usageHistory} color="var(--color-accent)" width={180} />}
-        value={<span className="text-text-strong">{usage}%</span>}
+        spark={<Sparkline data={usageHistory} color="var(--color-accent)" width={180} unit="%" />}
+        value={<span className="text-text-strong">{unavailable ? "—" : `${usage}%`}</span>}
       />
       <MetricRow
         label="Temperature"
         color={tempColor}
-        spark={<Sparkline data={tempHistory} color={tempColor} width={180} />}
-        value={<span className="text-text-strong">{tempLabel}</span>}
+        spark={
+          <Sparkline
+            data={tempHistory}
+            color={tempColor}
+            width={180}
+            format={tempFormatter(temperatureUnit)}
+          />
+        }
+        value={<span className="text-text-strong">{unavailable ? "—" : tempLabel}</span>}
       />
+      {thermal && thermal.level !== "unknown" && (
+        <div className="space-y-1 border-t border-border pt-3">
+          {tlimitC != null && (
+            <div className="flex justify-between text-sm">
+              <span className="text-muted">T.Limit headroom</span>
+              <span className={`font-tabular text-sm font-semibold ${headroomClass}`}>
+                {formatHeadroom(tlimitC, temperatureUnit)}
+              </span>
+            </div>
+          )}
+          {thermal.zoneMaxC != null && (
+            <div className="flex justify-between text-sm">
+              <span className="text-muted">Hottest zone</span>
+              <span className="font-tabular text-sm text-text">
+                {formatZone(thermal.zoneMaxC, thermal.zoneCritC, temperatureUnit)}
+              </span>
+            </div>
+          )}
+          {slowdownParts.length > 0 && (
+            <div className="text-xs text-muted">
+              Slowdown since boot:{" "}
+              {slowdownParts.map((part, i) => (
+                <span key={part.label}>
+                  {i > 0 && " · "}
+                  <span className={`font-tabular ${part.recent ? "font-semibold text-warning" : "text-text"}`}>
+                    {part.label} {formatMicros(part.us)}
+                  </span>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div className="flex justify-between text-sm">
         <span className="text-muted">{multiGpu ? "GPU Power (all cards)" : "GPU Power"}</span>
         <span className="font-tabular text-sm text-text">
-          {powerDraw}W / {powerLimit}W
+          {unavailable ? "—" : `${powerDraw}W / ${powerLimit}W`}
         </span>
       </div>
 
@@ -258,7 +363,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       {/* GPU-allocated memory (portion of the unified pool held by GPU compute apps) */}
       {gpu && (
         <div className="space-y-2 border-t border-border pt-3">
-          {vramTotal > 0 ? (
+          {!unavailable && vramTotal > 0 ? (
             <>
               <MetricBar
                 label={multiGpu ? "VRAM (all cards)" : "VRAM"}
@@ -277,7 +382,7 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
             <div className="flex justify-between text-xs">
               <span className="text-muted">VRAM</span>
               <span className="font-tabular text-text">
-                {vramUsed > 0 ? `${formatMb(vramUsed)} used` : "—"}
+                {!unavailable && vramUsed > 0 ? `${formatMb(vramUsed)} used` : "—"}
               </span>
             </div>
           )}

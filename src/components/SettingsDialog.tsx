@@ -103,9 +103,12 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
 
         {settings && !loading && (
           <div className="space-y-4">
-            {/* Poll interval */}
+            {/* Refresh interval */}
             <div>
-              <label className="mb-2 block text-xs text-muted">Poll interval</label>
+              <label className="mb-1 block text-xs text-muted">Refresh interval</label>
+              <p className="mb-2 text-[11px] text-muted">
+                How often the dashboard updates and records history. Collectors keep their own fixed rates.
+              </p>
               <div className="flex gap-2">
                 {POLL_PRESETS.map((preset) => (
                   <button

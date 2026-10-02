@@ -68,7 +68,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Non-Spark GPU hosts** | Linux boxes with a dedicated NVIDIA GPU are first-class units: same `nvidia-smi` collectors over SSH, detected hardware summary, and separate **RAM** / **VRAM** panels. Detail page: GPU (left) + **RAM → Network → Storage** (right column); Overview cards show RAM and VRAM bars |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, or q27; live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27; **daily peak** history on the LLM card |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, q27, or a llama-swap router (follows the engine that is actually loaded); live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27 |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Hermes Agent** | Opt-in per unit: background update check (10 min), status badges, one-click or batch `hermes update` |
 | **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet |
@@ -82,7 +82,11 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Spark uptime** | System uptime displayed inline on each Spark header for at-a-glance availability |
 | **Power controls** | Graceful shutdown (SSH host script) and Wake-on-LAN; batch actions on Overview |
 | **Spark roles** | **Head** / **Worker** / **Standalone** — worker label + head link; standalone can disable LLM monitoring; optional hide workers from Overview and tabs |
-| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s), GPU/CPU split, bandwidth via `nvidia-smi dmon`. Non-Spark hosts show discrete **VRAM** (nvidia-smi) and system **RAM** separately |
+| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s): a **Memory** card with the GPU / CPU / free split, OOM risk, *free for a new model*, swap and memory pressure. Non-Spark hosts show discrete **VRAM** (nvidia-smi) and system **RAM** separately |
+| **Host health** | Once a minute: pressure stall (PSI), load, swap, NVMe SMART (temperature, wear, TB written, unsafe shutdowns, media errors), PCIe AER totals, kernel GPU `Xid` lines (24 h), failed systemd units, Docker containers and the Wi-Fi link — with warn / critical levels and an Overview alert |
+| **7-day history** | One-minute averages of GPU usage / temperature / power, memory, CPU, network and LLM tok/s, persisted for 7 days; **History** card with 1h / 24h / 7d, axes and hover values |
+| **llama-swap router** | Model swaps with cold-load times, request outcomes per hour from llama-swap's activity log (OK / rejected 429 / failed), per-engine prompt tok/s, and **Load / Unload** that refuse while a video studio is rendering |
+| **Video studios** | ComfyUI studios behind llama-swap: active render, queue (cancel / remove), recent renders, 24 h GPU-busy chart, and chat requests waiting behind the GPU lease |
 | **Themes** | Dark, light, cool white, OLED — neutral palettes, persisted in `localStorage` |
 | **Secrets** | SSH passwords AES-256-GCM encrypted; never in `sparks.json` or API responses |
 | **Docker-first** | Single privileged container for host metrics; prod and dev Compose files |
@@ -365,7 +369,6 @@ sparkDash/
 | POST | `/api/sparks/:id/llm-ports` | Add an LLM port (hot) |
 | DELETE | `/api/sparks/:id/llm-ports/:port` | Remove an LLM port (hot) |
 | PUT | `/api/sparks/:id/llm-port` | LLM port — backward-compat (hot) |
-| GET | `/api/sparks/:id/llm/daily` | Daily busy decode/prefill tok/s (`port`, `days`) |
 | POST | `/api/sparks/:id/llm/bench` | Start decode benchmark (202); poll/cancel/clear on the same path |
 | POST | `/api/sparks/:id/llm/prefill-bench` | Start prefill + TTFT context sweep (202); poll/cancel/clear on the same path |
 | GET | `/api/settings` | Global settings |
@@ -559,8 +562,9 @@ Each configured LLM port gets its own `LlmProbe` instance running in parallel. P
 - **q27** (signalnine/q27 engine) — `/v1/models` (`owned_by: q27`) or Prometheus `q27_*` series; live tok/s from `q27_*_processed` counter diffs (completion-based totals as fallback), exact computed-only prefill with the cached/uncached split doubling as the prefix-cache hit rate, TTFT/E2E/ITL p95 histograms, and constant-0 preemptions (FIFO admission, no wait queue)
 - **TensorFold** (ashhart/TensorFold) — `/v1/models` (`owned_by: tensorfold`). It has no `/metrics`, and the CUDA server's `/health` is just `{ok: true}`, so live tok/s appears only when `/health` publishes cumulative `prompt_tokens_total` / `completion_tokens_total` (same contract as EXL3); otherwise the card shows the model and 0 tok/s. Decode/prefill benches and the showcase work regardless.
 - **vLLM / sglang** — `/v1/models`; sglang via `/server_info` (`last_gen_throughput` when metrics off; `/get_server_info` fallback), vLLM via Prometheus `/metrics` counters (scientific notation supported)
+- **llama-swap** (`owned_by: llama-swap`) — a router, not an engine: its `/v1/models` lists every configured model *and alias*, so identity comes from `GET /running` instead. The panel follows the most recently started resident engine (`process_start_time_seconds`), scrapes that engine directly, and shows a `llama-swap` chip, the resident-model count, and `loading <model>…` during a cold start. Every resident engine is scraped, so when more than one model holds memory the card lists each with its own tok/s and its own token counter
 
-Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). Multiple ports can be added or removed at runtime without restarting the monitor.
+Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). An engine is identified by `model@process_start_time_seconds`, so a swap or restart re-baselines the counters instead of reporting the reset as a burst. Multiple ports can be added or removed at runtime without restarting the monitor.
 
 Live probes still use the LAN IP on remote units. **Decode and prefill benches** try that same HTTP target first; if it is closed they open an SSH local-forward onto the remote’s `127.0.0.1` so loopback-bound servers (ds4 `start.sh` default) can still be measured. The tunnel is torn down when the job finishes or is cancelled.
 

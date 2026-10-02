@@ -9,6 +9,7 @@ import { SparkRegistry } from "./sparks/SparkRegistry.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
 import { sshExec } from "./collectors/ssh.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
+import { routerActionVerdict, videoCancelVerdict } from "./collectors/swapRouter.js";
 import {
   validateSparkTarget,
   createRateLimiter,
@@ -35,13 +36,14 @@ import { showcaseManager } from "./collectors/ShowcaseManager.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
 import { onceClose, resolveLlmHttpTarget } from "./collectors/llmTunnel.js";
 import { formatLlmBaseUrl, parseLlmTargetInput } from "../src/shared/llmTarget.js";
-import { llmDaily } from "./collectors/LlmDaily.js";
 import {
   createLlmTokenRuntime,
   registerLlmTokenTotalsRoute,
   llmTokenLedger,
 } from "./llmtokens/LlmTokenRuntime.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
+import { llmHourly } from "./collectors/LlmHourly.js";
+import { metricsHistory, MAX_SAMPLES, HISTORY_RANGES } from "./collectors/MetricsHistory.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 import { FLEET_ENERGY_JSON_PATH } from "./config.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
@@ -543,6 +545,27 @@ app.post("/api/sparks/:id/test", async (req, res) => {
   }
 });
 
+// Stop the running studio render or dequeue a pending one (video studio queue only).
+app.post("/api/sparks/:id/video/cancel", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many cancellation requests; try again shortly");
+  }
+  try {
+    const spark = registry.getSpark(req.params.id);
+    const mon = monitors.get(req.params.id);
+    if (!spark || !mon?.videoProbe) return res.status(404).json({ error: "Video studio not found" });
+    const promptId = req.body?.promptId;
+    const port = mon.videoProbe.studioPort();
+    const verdict = videoCancelVerdict({ promptId, studioPort: port, jobState: mon.videoProbe.jobState(promptId) });
+    if (verdict) return res.status(verdict.status).json({ error: verdict.error });
+    const result = await comfyCancelJob(spark, promptId, port);
+    void mon._pollDomain("video");
+    res.json({ success: result.ok, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Cancel a ComfyUI job (running interrupt and/or pending dequeue).
 app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
   if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
@@ -563,6 +586,85 @@ app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
     const mon = monitors.get(req.params.id);
     if (mon) void mon._pollDomain?.("comfy");
     res.json({ success: result.ok, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Shared prelude of the llama-swap router action routes: resolve the spark and the
+ * router probe named by the body, then ask `routerActionVerdict` whether the action
+ * may proceed. Sends the error response itself and returns null when it may not.
+ * @param {"load" | "unload"} action
+ */
+function resolveRouterAction(req, res, action) {
+  const spark = registry.getSpark(req.params.id);
+  const mon = monitors.get(req.params.id);
+  if (!spark || !mon) {
+    res.status(404).json({ error: "Spark not found" });
+    return null;
+  }
+  const { port, model } = req.body || {};
+  if (!Number.isInteger(port)) {
+    res.status(400).json({ error: "port (number) and model (string, max 200 characters) are required" });
+    return null;
+  }
+  const probe = mon.llmProbes.get(port);
+  if (!probe) {
+    res.status(404).json({ error: `No LLM endpoint on port ${port}` });
+    return null;
+  }
+  if (probe.router !== "llama-swap") {
+    res.status(400).json({ error: `Port ${port} is not a llama-swap router` });
+    return null;
+  }
+  const verdict = routerActionVerdict({
+    action,
+    model,
+    runningModels: probe.runningModels(),
+    studio: probe.studio,
+    routerModels: probe.routerModels,
+    video: mon.snapshot().metrics.video ?? null,
+    loadInFlight: probe.isLoadInFlight(),
+  });
+  if (verdict) {
+    res.status(verdict.status).json({ error: verdict.error });
+    return null;
+  }
+  return { mon, probe, model };
+}
+
+// Unload one model behind a llama-swap router.
+app.post("/api/sparks/:id/llm/router/unload", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many unload requests; try again shortly");
+  }
+  try {
+    const target = resolveRouterAction(req, res, "unload");
+    if (!target) return;
+    const { mon, probe, model } = target;
+    const result = await probe.routerUnload(model);
+    void mon._pollDomain("llm");
+    if (!result.ok) return res.status(502).json({ error: result.message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start loading one model behind a llama-swap router (fire-and-forget; the panel watches /running).
+app.post("/api/sparks/:id/llm/router/load", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many load requests; try again shortly");
+  }
+  try {
+    const target = resolveRouterAction(req, res, "load");
+    if (!target) return;
+    const { probe, model } = target;
+    if (!probe.routerLoad(model).started) {
+      return res.status(409).json({ error: "A model load could not be started" });
+    }
+    res.status(202).json({ success: true, status: "loading" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -954,10 +1056,10 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
 });
 
 /**
- * Daily decode / prefill tok/s rollups (busy samples, last 14 UTC days by default).
- * Query: port (required for multi-port), days (1–30).
+ * Hourly generated-token volume (last 24 hours by default, 7 days retained).
+ * Query: port (required for multi-port), hours (1–168).
  */
-app.get("/api/sparks/:id/llm/daily", (req, res) => {
+app.get("/api/sparks/:id/llm/hourly", (req, res) => {
   const spark = registry.getSpark(req.params.id);
   if (!spark) return res.status(404).json({ error: "Spark not found" });
   const ports =
@@ -968,9 +1070,23 @@ app.get("/api/sparks/:id/llm/daily", (req, res) => {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return res.status(400).json({ error: "Invalid port" });
   }
-  let days = req.query.days != null ? Number(req.query.days) : 14;
-  if (!Number.isFinite(days)) days = 14;
-  res.json(llmDaily.getSeries(spark.id, port, { days }));
+  let hours = req.query.hours != null ? Number(req.query.hours) : 24;
+  if (!Number.isFinite(hours)) hours = 24;
+  res.json(llmHourly.getSeries(spark.id, port, { hours }));
+});
+
+/**
+ * Long-term downsampled metric series (1-minute averages kept 7 days).
+ * Query: range = 1h | 24h | 7d (default 24h).
+ */
+app.get("/api/sparks/:id/history", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const range = req.query.range != null ? String(req.query.range) : "24h";
+  if (!Object.hasOwn(HISTORY_RANGES, range)) {
+    return res.status(400).json({ error: "Invalid range (use 1h, 24h or 7d)" });
+  }
+  res.json(metricsHistory.getRange(spark.id, range));
 });
 
 /**
@@ -1622,6 +1738,24 @@ wss.on("connection", (ws) => {
   } catch {
     // The close handler will clean up a client that disappears during connect.
   }
+  // Then seed this client's sparkline history, so the charts open with the
+  // retained window instead of building up from an empty tab. Sent to this
+  // socket only — the other clients already have their series. The client
+  // replaces a series only when the server's copy is longer than its own.
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "history",
+        series: metricsHistory.getAll(),
+        // Sample timestamps, so the client can label the age of the leftmost
+        // point instead of inferring it from the sample count.
+        meta: metricsHistory.getMeta(),
+        max: MAX_SAMPLES,
+      })
+    );
+  } catch (err) {
+    console.error("[ws] history hydration failed:", err.message);
+  }
   ws.on("close", () => {
     console.log("[ws] client disconnected");
   });
@@ -1680,6 +1814,10 @@ function forceBroadcast() {
 function startBroadcast() {
   const interval = getSettings().pollIntervalMs;
   broadcastTimer = setInterval(() => {
+    // Record before the skip below: history must advance at a steady cadence
+    // even on an idle box whose snapshot happens to serialize identically.
+    // Only the timer feeds history — forceBroadcast() must not double-sample.
+    metricsHistory.recordSnapshot(orderedSnapshots());
     const payload = buildSnapshotPayload();
     // Skip the broadcast entirely when nothing changed since the last tick.
     // A 1s poll that produces identical snapshots becomes free for idle tabs.
@@ -1741,15 +1879,20 @@ async function shutdown(signal) {
     console.error("[sparkDash] failed to finalize benchmarks:", err.message);
   }
   try {
-    llmDaily.flush();
+    llmHourly.flush();
   } catch (err) {
-    console.error("[sparkDash] failed to flush LLM daily history:", err.message);
+    console.error("[sparkDash] failed to flush LLM hourly history:", err.message);
   }
   llmTokenRuntime.stop();
   const energyPersistenceSucceeded = fleetEnergyRuntime.stop();
   const streamAgentClosedGracefully = await closeLlmStreamAgent();
   if (!streamAgentClosedGracefully) {
     console.warn("[sparkDash] LLM dispatcher close timed out; destroyed open sockets");
+  }
+  try {
+    metricsHistory.flushAll();
+  } catch (err) {
+    console.error("[sparkDash] failed to flush metrics history:", err.message);
   }
   try {
     if (broadcastTimer) {

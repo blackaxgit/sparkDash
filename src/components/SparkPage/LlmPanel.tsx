@@ -1,21 +1,38 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import type { LlmMetrics, LlmBenchTarget } from "../../api/types";
-import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
+import type { LlmMetrics, LlmBenchTarget, VideoLlmWait } from "../../api/types";
+import { routerUnload, setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
 import {
   useMetricsHistory,
   useMetricsHistoryTail,
+  useTimedMetricsHistory,
   avgPositive,
 } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { PrefillBenchDialog } from "./PrefillBenchDialog";
-import { LlmDailyChart } from "./LlmDailyChart";
+import { LlmHourlyChart } from "./LlmHourlyChart";
 import { LlmTokenTotals } from "./LlmTokenTotals";
 import { parseLlmTargetInput } from "../../shared/llmTarget.js";
 import { backendLabel } from "../../shared/llmBackends.js";
 import { LlmTrendChart } from "./LlmTrendChart";
+import { RouterPanel } from "./RouterPanel";
+
+/**
+ * Wall-clock span of a chart, for the age axis. Whole units only: the axis
+ * answers "seconds or an hour?", and a second of precision on a 40-minute
+ * chart is noise that changes on every frame.
+ */
+function formatAge(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest ? `${h} h ${rest} min` : `${h} h`;
+}
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
@@ -29,6 +46,8 @@ interface LlmPanelProps {
   shareImage?: boolean;
   onRemovePort?: (port: number) => void;
   className?: string;
+  /** Requests queued in llama-swap for an unloaded chat model (spark.metrics.video?.llmWait). */
+  llmWait?: VideoLlmWait | null;
 }
 
 const VLLM_METRIC_INFO = {
@@ -271,16 +290,37 @@ function LlmLaunchers({
   );
 }
 
-/** Backend badge — neutral surfaces with a single accent dot. No blue/purple. */
-function BackendBadge({ backend }: { backend: string | null }) {
+/**
+ * Backend badge — neutral surfaces with a single accent dot. No blue/purple.
+ * `router` names the proxy in front of the engine (llama-swap), because on a
+ * router port the engine changes under the same port as models swap.
+ */
+function BackendBadge({
+  backend,
+  router,
+}: {
+  backend: string | null;
+  router?: string | null;
+}) {
   const label = backendLabel(backend);
-  if (!label) return <span className="text-xs text-muted">No backend</span>;
 
   return (
-    <span className="llm-badge">
-      <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-      {label}
-    </span>
+    <>
+      {label ? (
+        <span className="llm-badge">
+          <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+          {label}
+        </span>
+      ) : (
+        <span className="text-xs text-muted">No backend</span>
+      )}
+      {router && (
+        <span className="llm-badge" title={`Model router on this port (${router})`}>
+          <span className="h-1.5 w-1.5 rounded-full bg-muted" />
+          {router}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -384,6 +424,7 @@ export function LlmPanel({
   shareImage = false,
   onRemovePort,
   className,
+  llmWait,
 }: LlmPanelProps) {
   // Tail keyed by port so multi-port LLM sparklines stay distinct (8b).
   const genHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.tps`);
@@ -400,12 +441,34 @@ export function LlmPanel({
   const prefillAvg = useMemo(() => avgPositive(prefillFull), [prefillFull]);
   const cachedPrefillAvg = useMemo(() => avgPositive(cachedFull), [cachedFull]);
   const uncachedPrefillAvg = useMemo(() => avgPositive(uncachedFull), [uncachedFull]);
+
+  // Age axis describes the plotted (tail) window, so read the oldest tail
+  // timestamp from the generation series: it is always present on an LLM panel.
+  const genTimed = useTimedMetricsHistory(sparkId, `llm:${llmPort}.tps`);
+  const genTailStart =
+    genHistory.length > 1
+      ? genTimed[Math.max(0, genTimed.length - genHistory.length)]?.at
+      : undefined;
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [clearApiKey, setClearApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [unloading, setUnloading] = useState<string | null>(null);
+  const [unloadError, setUnloadError] = useState<string | null>(null);
+  const handleUnload = async (model: string) => {
+    if (!confirm(`Unload ${model}? Requests to it will cold-start it again.`)) return;
+    setUnloading(model);
+    setUnloadError(null);
+    try {
+      await routerUnload(sparkId, llmPort, model);
+    } catch (err) {
+      setUnloadError(err instanceof Error ? err.message : "Unload failed");
+    } finally {
+      setUnloading(null);
+    }
+  };
   const [engineInfoOpen, setEngineInfoOpen] = useState(false);
   const [benchOpen, setBenchOpen] = useState(false);
   const [prefillBenchOpen, setPrefillBenchOpen] = useState(false);
@@ -555,10 +618,27 @@ export function LlmPanel({
         </div>
       }
     >
+      {llm?.studio && (
+        <div
+          role="status"
+          className="mb-3 rounded border border-warning/40 bg-warning/15 px-3 py-2 text-xs font-medium text-warning"
+          title="A ComfyUI video studio is resident in llama-swap's exclusive group, so chat models are unloaded and LLM requests wait until it is released."
+        >
+          <div>
+            GPU held by video studio {llm.studio.name ?? llm.studio.model} — chat models unloaded
+          </div>
+          {llmWait != null && llmWait.waiting > 0 && (
+            <div className="mt-0.5 font-tabular font-normal">
+              {llmWait.waiting} request{llmWait.waiting === 1 ? "" : "s"} waiting
+              {llmWait.oldestMs != null ? ` (oldest ${formatAge(llmWait.oldestMs)})` : ""}
+            </div>
+          )}
+        </div>
+      )}
       {showSettings ? (
         <div className="space-y-3">
           <p className="text-[10px] text-muted">
-            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / OpenAI-compatible gateway).
+            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / llama-swap / OpenAI-compatible gateway).
           </p>
           <label className="block space-y-1">
             <span className="text-xs text-muted">Port</span>
@@ -659,9 +739,14 @@ export function LlmPanel({
             <p className="text-xs text-muted">
               {llm?.posture?.auth === "protected"
                 ? `${llm.posture.label} on :${llmPort}`
-                : `No model loaded on :${llmPort}`}
+                : llm?.routerLoading
+                  ? `Loading ${llm.routerLoading} on :${llmPort}…`
+                  : llm?.router
+                    ? `${llm.router} idle on :${llmPort} — no model resident`
+                    : `No model loaded on :${llmPort}`}
             </p>
           </div>
+          {llm?.error && <p className="text-[10px] text-danger">{llm.error}</p>}
           <LlmLaunchers
             sparkId={sparkId}
             llmPort={llmPort}
@@ -671,14 +756,23 @@ export function LlmPanel({
             onRemoteDecode={openRemoteDecode}
             onRemotePrefill={openRemotePrefill}
           />
-          <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+          {llm && <RouterPanel sparkId={sparkId} llmPort={llmPort} llm={llm} />}
+          <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
           <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
       ) : (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <BackendBadge backend={llm?.backend ?? null} />
+            <BackendBadge backend={llm?.backend ?? null} router={llm?.router ?? null} />
             {llm?.posture && <PostureBadge posture={llm.posture} />}
+            {llm?.routerLoading && llm.routerLoading !== llm.routerModel && (
+              <span
+                className="shrink-0 text-[10px] text-muted"
+                title="A second model is cold-starting behind the router"
+              >
+                loading {llm.routerLoading}…
+              </span>
+            )}
             {llm?.modelId && (
               <span
                 className="min-w-0 flex-1 whitespace-normal break-words text-xs leading-snug text-text [overflow-wrap:anywhere]"
@@ -713,6 +807,16 @@ export function LlmPanel({
               </div>
             </div>
           </div>
+          {/* Chart-age axis for the generation sparkline above (tail window). */}
+          {genTailStart != null && (
+            <div className="-mt-2 flex justify-end text-[10px] text-muted">
+              <span
+                title={`Oldest plotted sample: ${new Date(genTailStart).toLocaleTimeString()} · ${genHistory.length} samples`}
+              >
+                {formatAge(Date.now() - genTailStart)} ago → now
+              </span>
+            </div>
+          )}
           <div
             className="flex items-center justify-between"
             title="Prompt tokens/sec taken in during the last poll window — cache-served + computed; the rows below split that total into the two parts. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Cached prefill does little GPU work; uncached prefill is what builds KV cache."
@@ -776,19 +880,96 @@ export function LlmPanel({
           )}
 
           <LlmTrendChart sparkId={sparkId} llmPort={llmPort} />
-          <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+          <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
+
+          {/*
+            More than one engine resident: the card's rates and totals describe
+            the followed one, so name every model that is holding memory with
+            its own tokens — otherwise a busy second model looks idle.
+          */}
+          {(llm?.routerEngines?.length ?? 0) > 0 && (
+            <div className="space-y-1 border-t border-border pt-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted">
+                Resident models
+              </div>
+              {llm?.routerEngines?.map((e) => (
+                <div key={e.model} className="flex items-baseline gap-2 text-xs">
+                  <span
+                    className={`min-w-0 flex-1 truncate ${e.active ? "text-text" : "text-muted"}`}
+                    title={e.name ? `${e.name} · ${e.model}` : e.model}
+                  >
+                    {e.active && <span className="mr-1 text-accent">•</span>}
+                    {e.model}
+                  </span>
+                  <span
+                    className={`w-20 shrink-0 text-right font-tabular ${
+                      e.generationTps > 0 ? "text-accent" : "text-muted"
+                    }`}
+                    title="Live decode rate of this engine"
+                  >
+                    {e.generationTps.toFixed(1)} tok/s
+                  </span>
+                  {(e.promptTps ?? 0) > 0 || e.generationTps === 0 ? (
+                    <span
+                      className="shrink-0 text-right font-tabular text-muted"
+                      title="Live prompt (prefill) rate of this engine"
+                    >
+                      prompt {(e.promptTps ?? 0).toFixed(1)} tok/s
+                    </span>
+                  ) : null}
+                  <span
+                    className="w-24 shrink-0 text-right font-tabular text-muted"
+                    title="Tokens this engine has generated since it started"
+                  >
+                    {e.totalOutputTokens.toLocaleString()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleUnload(e.model)}
+                    disabled={unloading !== null}
+                    className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:border-danger hover:text-danger disabled:opacity-50"
+                    title={`Unload ${e.model}`}
+                  >
+                    {unloading === e.model ? "Unloading…" : "Unload"}
+                  </button>
+                </div>
+              ))}
+              {unloadError && <p className="text-[10px] text-danger">{unloadError}</p>}
+            </div>
+          )}
+
+          {llm && <RouterPanel sparkId={sparkId} llmPort={llmPort} llm={llm} />}
 
           <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Slots</div>
-              <div className="font-tabular text-sm text-text">
-                {(llm?.slotsTotal ?? 0) > 0
-                  ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
-                  : (llm?.slotsActive ?? 0) > 0
-                    ? `${llm?.slotsActive} running`
+            {/*
+              A router has no slot concept and vLLM does not export one, so the
+              tile would read "—" forever. On a single unified-memory pool the
+              honest number there is how many models are holding memory.
+            */}
+            {llm?.router && (llm?.slotsTotal ?? 0) === 0 ? (
+              <div className="space-y-0.5">
+                <div className="text-[10px] uppercase tracking-wide text-muted">Resident</div>
+                <div
+                  className="font-tabular text-sm text-text"
+                  title="Models loaded behind the router right now"
+                >
+                  {(llm?.routerResident ?? 0) > 0
+                    ? `${llm?.routerResident} model${llm?.routerResident === 1 ? "" : "s"}`
                     : "—"}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-0.5">
+                <div className="text-[10px] uppercase tracking-wide text-muted">Slots</div>
+                <div className="font-tabular text-sm text-text">
+                  {(llm?.slotsTotal ?? 0) > 0
+                    ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
+                    : (llm?.slotsActive ?? 0) > 0
+                      ? `${llm?.slotsActive} running`
+                      : "—"}
+                </div>
+              </div>
+            )}
             <div className="space-y-0.5">
               <div className="text-[10px] uppercase tracking-wide text-muted">Context</div>
               <div className="font-tabular text-sm text-text">

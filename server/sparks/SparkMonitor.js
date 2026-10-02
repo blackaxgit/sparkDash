@@ -6,9 +6,11 @@ import {
 } from "../collectors/SystemCollector.js";
 import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
+import { VideoStudioProbe } from "../collectors/VideoStudioProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
-import { llmDaily } from "../collectors/LlmDaily.js";
+import { HostHealthProbe } from "../collectors/HostHealthProbe.js";
+import { llmHourly } from "../collectors/LlmHourly.js";
 import { sshExec } from "../collectors/ssh.js";
 import {
   POLL_INTERVAL_GPU,
@@ -17,6 +19,8 @@ import {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
+  POLL_INTERVAL_VIDEO,
+  POLL_INTERVAL_HOST_HEALTH,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
   POLL_INTERVAL_HERMES,
@@ -62,10 +66,20 @@ export class SparkMonitor {
       ? new ComfyProbe(spark, this._comfyPort(spark))
       : null;
 
+    // Video studio (ComfyUI behind llama-swap): only for sparks with LLM monitoring on; the
+    // probe stays silent (null) until an LLM port is detected as a llama-swap router.
+    /** @type {VideoStudioProbe | null} */
+    this.videoProbe = this._llmMonitoringEnabled(spark)
+      ? new VideoStudioProbe(spark, { routerPorts: () => this._routerPorts() })
+      : null;
+
     /** @type {TailscaleProbe | null} */
     this.tailscaleProbe = this._tailscaleMonitoringEnabled(spark)
       ? new TailscaleProbe(spark)
       : null;
+
+    // Host health (PSI, NVMe, AER, Xid, units, containers, Wi-Fi): always on, one script per poll.
+    this.hostHealthProbe = new HostHealthProbe(spark);
 
     /** @type {HermesProbe | null} */
     this.hermesProbe = this._hermesMonitoringEnabled(spark)
@@ -90,6 +104,9 @@ export class SparkMonitor {
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
     this.lastOnlineOk = 0;
+    // True only while the latest liveness check has failed for the current run. While it is
+    // false (before the first check, or after a success) domains must still poll.
+    this._offlineConfirmed = false;
 
     // System uptime seconds (from /proc/uptime), null when offline
     this._uptimeSeconds = null;
@@ -104,7 +121,9 @@ export class SparkMonitor {
       unifiedMemory: this.collector._defaultUnifiedMemory(),
       llm: [],
       comfy: null,
+      video: null,
       tailscale: null,
+      hostHealth: null,
     };
     this._lastUpdate = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
@@ -151,6 +170,7 @@ export class SparkMonitor {
     this._runGeneration += 1;
     this._inflight = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
+    this._offlineConfirmed = false;
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -166,6 +186,9 @@ export class SparkMonitor {
       } else {
         this.llmProbes.set(port, new LlmProbe(spark, port));
       }
+    }
+    for (const [port, stale] of prevProbes) {
+      if (this.llmProbes.get(port) !== stale) stale.dispose?.();
     }
     if (!this._llmMonitoringEnabled()) {
       this._metrics.llm = [];
@@ -190,6 +213,21 @@ export class SparkMonitor {
       this.comfyProbe = null;
       this._metrics.comfy = null;
     }
+
+    // Video studio probe — create / update / clear with LLM monitoring
+    if (this._llmMonitoringEnabled()) {
+      if (this.videoProbe) {
+        this.videoProbe.setTarget(spark);
+      } else {
+        this.videoProbe = new VideoStudioProbe(spark, { routerPorts: () => this._routerPorts() });
+      }
+    } else {
+      if (this.videoProbe) this.videoProbe.dispose();
+      this.videoProbe = null;
+      this._metrics.video = null;
+    }
+
+    this.hostHealthProbe.setTarget(spark);
 
     // Tailscale probe — create / update / clear
     if (this._tailscaleMonitoringEnabled()) {
@@ -396,11 +434,21 @@ export class SparkMonitor {
     return [LLM_PORT];
   }
 
+  /** LLM ports whose probe has detected a llama-swap router. */
+  _routerPorts() {
+    const ports = [];
+    for (const probe of this.llmProbes.values()) {
+      if (probe.router === "llama-swap") ports.push(probe.port);
+    }
+    return ports;
+  }
+
   /** Start background polling. */
   start() {
     if (this._running) return;
     this._runGeneration += 1;
     this._running = true;
+    this._offlineConfirmed = false;
     this._stopped = false;
     this._poll();
     this._intervals.push(setInterval(() => this._pollDomain("gpu"), POLL_INTERVAL_GPU));
@@ -410,6 +458,8 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("ram"), POLL_INTERVAL_CPU));
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
+    this._intervals.push(setInterval(() => this._pollDomain("video"), POLL_INTERVAL_VIDEO));
+    this._intervals.push(setInterval(() => this._pollDomain("hostHealth"), POLL_INTERVAL_HOST_HEALTH));
     this._restartComfyPollInterval();
     this._restartHermesPollInterval();
     this._restartTailscalePollInterval();
@@ -439,6 +489,15 @@ export class SparkMonitor {
         /* ignore */
       }
     }
+    if (this.videoProbe) {
+      try {
+        this.videoProbe.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const probe of this.llmProbes.values()) probe.dispose?.();
+    this.hostHealthProbe.dispose();
     console.log(`[SparkMonitor] ${this.spark.id} stopped`);
   }
 
@@ -494,6 +553,8 @@ export class SparkMonitor {
         unifiedMemory: this._metrics.unifiedMemory,
         llm: this._metrics.llm,
         comfy: comfyOn ? this._metrics.comfy : null,
+        video: this._metrics.video ?? undefined,
+        hostHealth: this._metrics.hostHealth,
         tailscale: tailscaleOn ? this._metrics.tailscale : null,
       },
     };
@@ -547,6 +608,7 @@ export class SparkMonitor {
       if (!isCurrentRun()) return;
       this.online = true;
       this.lastOnlineOk = Date.now();
+      this._offlineConfirmed = false;
       this._uptimeSeconds = uptimeSeconds;
     } catch {
       if (!isCurrentRun()) return;
@@ -554,6 +616,7 @@ export class SparkMonitor {
         this.online = false;
         this._uptimeSeconds = null;
       }
+      this._offlineConfirmed = true;
     } finally {
       if (this._inflight.online === checkToken) {
         this._inflight.online = false;
@@ -574,6 +637,8 @@ export class SparkMonitor {
       this._pollDomain("memory"),
       this._pollDomain("llm"),
       this._pollDomain("comfy"),
+      this._pollDomain("video"),
+      this._pollDomain("hostHealth"),
       this._pollDomain("hermes"),
       this._pollDomain("tailscale"),
     ]);
@@ -581,11 +646,15 @@ export class SparkMonitor {
 
   async _pollDomain(domain) {
     if (!this._running || this._inflight[domain]) return;
+    // Offline hosts: skip every domain (liveness keeps running via _checkOnline, which
+    // flips `online` back and so resumes polling on the next tick).
+    if (this._offlineConfirmed && this.online === false) return;
     // Skip storage auto-poll when disabled for this spark
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API
     if (domain === "llm" && !this._llmMonitoringEnabled()) return;
     if (domain === "comfy" && !this._comfyMonitoringEnabled()) return;
+    if (domain === "video" && !this.videoProbe) return;
     if (domain === "hermes" && !this._hermesMonitoringEnabled()) return;
     if (domain === "tailscale" && !this._tailscaleMonitoringEnabled()) return;
     const runGeneration = this._runGeneration;
@@ -620,6 +689,12 @@ export class SparkMonitor {
           break;
         case "comfy":
           result = this.comfyProbe ? await this.comfyProbe.probe() : null;
+          break;
+        case "video":
+          result = this.videoProbe ? await this.videoProbe.probe() : null;
+          break;
+        case "hostHealth":
+          result = await this.hostHealthProbe.probe();
           break;
         case "tailscale":
           result = this.tailscaleProbe ? await this.tailscaleProbe.probe() : null;
@@ -668,12 +743,20 @@ export class SparkMonitor {
             const probes = Array.from(this.llmProbes.values());
             for (let i = 0; i < result.length; i++) {
               const probe = probes[i];
-              if (probe) llmDaily.record(this.spark.id, probe.port, result[i]);
+              if (probe) {
+                llmHourly.record(this.spark.id, probe.port, result[i]);
+              }
             }
           }
           break;
         case "comfy":
           this._metrics.comfy = result;
+          break;
+        case "video":
+          this._metrics.video = result;
+          break;
+        case "hostHealth":
+          this._metrics.hostHealth = result;
           break;
         case "tailscale":
           this._metrics.tailscale = result;

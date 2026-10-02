@@ -3,6 +3,25 @@ import path from "path";
 import { HOST_PATHS, GPU_MEMORY_JSON_PATH, DGX_SPARK, HARDWARE_DEFAULTS, POLL_INTERVAL_NVERR } from "../config.js";
 import { normalizeMac, WOL_INTERFACE } from "../wol.js";
 import { sshExec } from "./ssh.js";
+import {
+  THERMAL_SMI_ARGS,
+  evaluateThermal,
+  parseThermalSmi,
+  parseZoneDump,
+  recordThermalSample,
+  summarizeZones,
+} from "./thermalStatus.js";
+
+/** The optional thermal query runs at most this often per collector. */
+const THERMAL_MIN_INTERVAL_MS = 10_000;
+/** After the optional nvidia-smi thermal query fails, leave it alone this long. */
+const THERMAL_SMI_BACKOFF_MS = 10 * 60_000;
+/**
+ * Remote equivalent of _readLocalThermalZones: `T <milliC>` per zone temperature and
+ * `C <milliC>` per `critical` trip point (parsed by parseZoneDump).
+ */
+const REMOTE_ZONE_SCRIPT =
+  'for z in /sys/class/thermal/thermal_zone*; do [ -r "$z/temp" ] && echo "T $(cat "$z/temp" 2>/dev/null)"; for p in "$z"/trip_point_*_type; do [ -r "$p" ] || continue; [ "$(cat "$p" 2>/dev/null)" = critical ] && echo "C $(cat "${p%_type}_temp" 2>/dev/null)"; done; done';
 
 const NVERR_JOURNAL_CMD =
   'journalctl -k --no-pager -q --grep=NV_ERR_NO_MEMORY 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true';
@@ -65,6 +84,14 @@ export class SystemCollector {
     this._hardwareInfo = null;
     /** Cached NVRM NV_ERR_NO_MEMORY count (slow journal scan). */
     this._nvErrCache = { count: 0, at: 0 };
+
+    // Optional thermal query state (see _collectThermal)
+    /** @type {import("./thermalStatus.js").ThermalSample[]} */
+    this._thermalHistory = [];
+    /** @type {{ at: number, value: import("./thermalStatus.js").GpuThermal | null } | null} */
+    this._thermalCache = null;
+    /** Epoch ms before which the optional nvidia-smi thermal query is not retried. */
+    this._thermalSmiBackoffUntil = 0;
   }
 
   /** Collect GPU metrics (temperature, usage, power, VRAM). */
@@ -73,7 +100,15 @@ export class SystemCollector {
       const gpuData = this.spark.isLocal
         ? await this._getGPUAll()
         : await this._getRemoteGpu();
-      return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
+      try {
+        const thermal = await this._collectThermal();
+        if (thermal) gpuData.thermal = thermal;
+      } catch (err) {
+        console.error(`[SystemCollector] Thermal error for ${this.spark.id}:`, err.message);
+      }
+      const collected = this._isSuccessfulGpuCollection(gpuData);
+      gpuData.collected = collected;
+      return tagCollectionResult(gpuData, collected);
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
       return tagCollectionResult(this._defaultGpu(), false);
@@ -243,6 +278,126 @@ export class SystemCollector {
       nvErrNoMemory: await this._nvErrNoMemory(),
       gpus: this._buildGpuDevices(devices, this._lastVramPerDevice ?? [], apps, vram),
     };
+  }
+
+  /**
+   * GPU thermal state: T.Limit headroom, slowdown counters and thermal zones.
+   *
+   * Uses a SEPARATE nvidia-smi query from the main GPU one (an unsupported field in
+   * the main query would break GPU metrics on other sparks), at most once per 10 s.
+   * When that query fails it is not retried for 10 min; thermal zones keep updating.
+   * @returns {Promise<import("./thermalStatus.js").GpuThermal | null>} null when a
+   *   remote spark cannot be reached (nothing is known, so nothing is reported)
+   */
+  async _collectThermal() {
+    const now = Date.now();
+    if (this._thermalCache && now - this._thermalCache.at < THERMAL_MIN_INTERVAL_MS) {
+      return this._thermalCache.value;
+    }
+    const smiDue = now >= this._thermalSmiBackoffUntil;
+    /** @type {import("./thermalStatus.js").SmiThermal | null} */
+    let smi = null;
+    let zones = { zoneMaxC: null, zoneCritC: null };
+    let reachable = true;
+
+    if (this.spark.isLocal) {
+      if (smiDue) {
+        try {
+          smi = parseThermalSmi(await this._nvidiaSmi(THERMAL_SMI_ARGS));
+        } catch {
+          smi = null;
+        }
+        if (!smi) this._thermalSmiBackoffUntil = now + THERMAL_SMI_BACKOFF_MS;
+      }
+      zones = this._readLocalThermalZones();
+    } else {
+      const cmd = [
+        smiDue ? `nvidia-smi ${THERMAL_SMI_ARGS} 2>/dev/null` : "true",
+        "echo '---'",
+        REMOTE_ZONE_SCRIPT,
+        "true",
+      ].join("; ");
+      try {
+        const sections = (await this._remoteExec(cmd)).split("---");
+        if (smiDue) {
+          smi = parseThermalSmi(sections[0] ?? "");
+          if (!smi) this._thermalSmiBackoffUntil = now + THERMAL_SMI_BACKOFF_MS;
+        }
+        zones = parseZoneDump(sections[1] ?? "");
+      } catch {
+        reachable = false;
+      }
+    }
+
+    if (!reachable) {
+      this._thermalCache = { at: now, value: null };
+      return null;
+    }
+
+    // Counters are only meaningful when the query succeeded this time; a backed-off
+    // or failed query reports null rather than a stale value.
+    const inputs = {
+      tlimitC: smi?.tlimitC ?? null,
+      zoneMaxC: zones.zoneMaxC,
+      zoneCritC: zones.zoneCritC,
+      hwSlowdownUs: smi?.hwSlowdownUs ?? null,
+      swSlowdownUs: smi?.swSlowdownUs ?? null,
+      powerCapUs: smi?.powerCapUs ?? null,
+    };
+    const value = evaluateThermal(inputs, this._thermalHistory, now);
+    if (smi) {
+      recordThermalSample(this._thermalHistory, {
+        at: now,
+        hw: inputs.hwSlowdownUs,
+        sw: inputs.swSlowdownUs,
+      });
+    }
+    this._thermalCache = { at: now, value };
+    return value;
+  }
+
+  /**
+   * Hottest thermal zone and lowest critical trip point from sysfs
+   * (HOST_PATHS.SYS when bind-mounted, else the container's own /sys).
+   * @returns {{ zoneMaxC: number | null, zoneCritC: number | null }}
+   */
+  _readLocalThermalZones() {
+    try {
+      const sysRoot = fs.existsSync(HOST_PATHS.SYS) ? HOST_PATHS.SYS : "/sys";
+      const thermalDir = path.join(sysRoot, "class/thermal");
+      if (!fs.existsSync(thermalDir)) return { zoneMaxC: null, zoneCritC: null };
+      const readInt = (file) => {
+        try {
+          const n = parseInt(fs.readFileSync(file, "utf-8").trim(), 10);
+          return Number.isFinite(n) ? n : null;
+        } catch {
+          return null;
+        }
+      };
+      const zones = [];
+      for (const zone of fs.readdirSync(thermalDir)) {
+        if (!zone.startsWith("thermal_zone")) continue;
+        const dir = path.join(thermalDir, zone);
+        const critMilliC = [];
+        for (const f of fs.readdirSync(dir)) {
+          const m = /^(trip_point_\d+)_type$/.exec(f);
+          if (!m) continue;
+          let type = "";
+          try {
+            type = fs.readFileSync(path.join(dir, f), "utf-8").trim();
+          } catch {
+            continue;
+          }
+          if (type !== "critical") continue;
+          const t = readInt(path.join(dir, `${m[1]}_temp`));
+          if (t != null) critMilliC.push(t);
+        }
+        zones.push({ tempMilliC: readInt(path.join(dir, "temp")), critMilliC });
+      }
+      return summarizeZones(zones);
+    } catch {
+      return { zoneMaxC: null, zoneCritC: null };
+    }
   }
 
   /**
@@ -1370,8 +1525,8 @@ export class SystemCollector {
           total: Math.round(parseInt(size) / 1024 / 1024),
           available: Math.round(parseInt(avail) / 1024 / 1024),
           percentage: parseInt(pct) || 0,
-          readSpeed: 0,
-          writeSpeed: 0,
+          readSpeed: null,
+          writeSpeed: null,
           disabled: isDisabled,
         });
       }
@@ -1718,6 +1873,11 @@ export class SystemCollector {
     return true;
   }
 
+  /** Run a command on this (remote) spark over SSH. Seam so tests need no ssh. */
+  _remoteExec(cmd) {
+    return sshExec(this.spark, cmd);
+  }
+
   // ─── Internal exec is local (Phase 2) ────────────────────
   /** Execute shell command locally, return trimmed stdout */
   async _exec(cmd) {
@@ -1791,6 +1951,7 @@ export class SystemCollector {
   // ─── Default metrics ─────────────────────────────────────
   _defaultGpu() {
     return {
+      collected: false,
       temperature: 0,
       usage: 0,
       power: { draw: 0, limit: 120, systemDraw: 0 },

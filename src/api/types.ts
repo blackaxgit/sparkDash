@@ -193,7 +193,119 @@ export interface GpuThrottle {
   detail: string;
 }
 
+/** GPU thermal headroom and slowdown state. */
+export interface GpuThermal {
+  /** nvidia-smi temperature.gpu.tlimit: degrees C of headroom to the slowdown limit. */
+  tlimitC: number | null;
+  /** Hottest /sys/class/thermal zone, degrees C. */
+  zoneMaxC: number | null;
+  /** Lowest 'critical' trip point among the zones, degrees C. */
+  zoneCritC: number | null;
+  /** clocks_event_reasons_counters.hw_thermal_slowdown (cumulative us since boot). */
+  hwSlowdownUs: number | null;
+  /** clocks_event_reasons_counters.sw_thermal_slowdown (cumulative us since boot). */
+  swSlowdownUs: number | null;
+  /** clocks_event_reasons_counters.sw_power_cap (cumulative us since boot). */
+  powerCapUs: number | null;
+  /** The hw counter grew within the last 10 min. */
+  hwSlowdownRecent: boolean;
+  /** The sw counter grew within the last 10 min. */
+  swSlowdownRecent: boolean;
+  level: "ok" | "warn" | "crit" | "unknown";
+  /** Human-readable reasons, e.g. "T.Limit headroom 2°C (≤ 2°C)". */
+  reasons: string[];
+}
+
+// ─── Video studio (ComfyUI behind llama-swap) ────────────
+export interface VideoStudioInfo {
+  model: string;
+  name: string | null;
+  description: string | null;
+  port: number | null;
+  comfyVersion: string | null;
+  state: "ready" | "loading" | "unloaded";
+}
+
+export interface VideoModels {
+  diffusion: string[];
+  textEncoders: string[];
+  vae: string[];
+  loras: string[];
+}
+
+export interface VideoActiveJob {
+  promptId: string;
+  clientId: string | null;
+  startedAt: number;
+  elapsedMs: number;
+  etaMs: number | null;
+  /** Estimate: elapsed vs the median duration of recent successful jobs; capped at 99. */
+  percent: number | null;
+  models: VideoModels;
+  width: number | null;
+  height: number | null;
+  frames: number | null;
+  steps: number | null;
+}
+
+export interface VideoPendingJob {
+  promptId: string;
+  clientId: string | null;
+  queuedAt: number | null;
+}
+
+export interface VideoOutput {
+  filename: string;
+  subfolder: string;
+  kind: "video" | "audio" | "image" | "other";
+}
+
+export interface VideoRecentJob {
+  promptId: string;
+  status: "success" | "error" | "interrupted" | "unknown";
+  clientId: string | null;
+  startedAt: number | null;
+  endedAt: number | null;
+  durationMs: number | null;
+  outputs: VideoOutput[];
+}
+
+/** 24 buckets, oldest first; the last one is the current hour. */
+export interface VideoHourBucket {
+  hourStart: number;
+  renders: number;
+  busyMs: number;
+}
+
+export interface VideoLlmWait {
+  waiting: number;
+  oldestMs: number | null;
+  models: string[];
+}
+
+export interface VideoMetrics {
+  /** false: llama-swap unreachable, or no studio ever seen. */
+  available: boolean;
+  error?: string;
+  /** The resident studio; else the last one seen, with state 'unloaded'. */
+  studio: VideoStudioInfo | null;
+  queueRunning: number;
+  queuePending: number;
+  active: VideoActiveJob | null;
+  /** Max 10. */
+  pending: VideoPendingJob[];
+  /** Max 12, newest first. */
+  recent: VideoRecentJob[];
+  /** 24 hourly buckets. */
+  hourly: VideoHourBucket[];
+  /** Requests waiting in llama-swap for a NON-studio model; null if /api/events is unavailable. */
+  llmWait: VideoLlmWait | null;
+  updatedAt: number;
+}
+
 export interface GpuMetrics {
+  /** false when the GPU collection failed or has not run yet: the values below are placeholders. */
+  collected?: boolean;
   temperature: number;
   usage: number;
   power: {
@@ -215,6 +327,8 @@ export interface GpuMetrics {
   throttle?: GpuThrottle | null;
   /** Kernel NVRM NV_ERR_NO_MEMORY count since boot (cached ~60s). */
   nvErrNoMemory?: number;
+  /** Thermal headroom / slowdown state (T.Limit, thermal zones, slowdown counters). */
+  thermal?: GpuThermal;
   /**
    * Per-physical-GPU breakdown for multi-card hosts. The fields above stay the
    * fleet-wide aggregate (hottest / busiest card, summed power and VRAM), so a
@@ -260,8 +374,9 @@ export interface StorageMetrics {
   total: number;
   available: number;
   percentage: number;
-  readSpeed: number;
-  writeSpeed: number;
+  /** Bytes/s. null when the collector cannot measure it (remote sparks). */
+  readSpeed: number | null;
+  writeSpeed: number | null;
   /** Present when device is in disabledDevices; still returned for Settings UI */
   disabled?: boolean;
 }
@@ -300,6 +415,60 @@ export interface UnifiedMemoryMetrics {
     current: number;
     peak: number;
   };
+}
+
+/** One model resident behind a llama-swap router, with its own token counters. */
+export interface LlmRouterEngine {
+  /** Router key — what a client sends to reach this model. */
+  model: string;
+  /** Friendly name from the router config, when it has one. */
+  name: string | null;
+  /** Live decode rate of this engine (tok/s). */
+  generationTps: number;
+  /** Tokens this engine has generated since it started. */
+  totalOutputTokens: number;
+  /** True for the engine the rest of the card describes. */
+  active: boolean;
+  /** Live prompt (prefill) rate of this engine (tok/s); 0 when idle. Shows embedders' work. */
+  promptTps?: number;
+}
+
+/** A llama-swap model state change seen between two `/running` polls. */
+export interface LlmRouterEvent {
+  at: number;
+  model: string;
+  state: "loading" | "ready" | "stopped";
+  /** ready only: ms from the first `loading` sighting to `ready`; null when the load was not observed. */
+  loadMs: number | null;
+}
+
+export interface LlmRouterRequestCounts {
+  /** 1xx–3xx responses. */
+  ok: number;
+  /** HTTP 429 — shed by llama-swap's concurrency queue (e.g. while a studio holds the GPU). */
+  rejected: number;
+  /** Any other status ≥ 400. */
+  failed: number;
+}
+
+/** Request outcomes from llama-swap's own activity log (`/api/metrics/activity`). */
+export interface LlmRouterActivity {
+  /** 24 hourly buckets, oldest first; the last one is the current hour. */
+  hourly: (LlmRouterRequestCounts & { hourStart: number })[];
+  /** Rolling last 60 minutes. */
+  lastHour: LlmRouterRequestCounts;
+  /** Newest first, at most 5. */
+  recentErrors: { at: number; model: string; status: number; message: string | null; src: string | null }[];
+  /** True when the activity page was full (999 rows): the hourly chart covers fewer than 24 h. */
+  truncated: boolean;
+  updatedAt: number;
+}
+
+/** A model configured in llama-swap (aliases excluded). */
+export interface LlmRouterModel {
+  id: string;
+  name: string | null;
+  loaded: boolean;
 }
 
 // ─── LLM metrics ─────────────────────────────────────────
@@ -345,32 +514,50 @@ export interface LlmMetrics {
   itlP95Seconds?: number | null;
   /** vLLM speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
   mtpAcceptanceRate?: number | null;
+  /** "llama-swap" when this port is a model router in front of N engines. */
+  router?: "llama-swap" | null;
+  /** Router key of the engine being shown — the id clients must send. */
+  routerModel?: string | null;
+  /** Human label for that model from the router config. */
+  routerModelName?: string | null;
+  /** Router key of a model that is mid-load (cold start). */
+  routerLoading?: string | null;
+  /** Models holding memory behind the router right now. */
+  routerResident?: number | null;
+  /**
+   * One row per model holding memory behind the router, followed model first.
+   * Each engine counts its own tokens from its own start.
+   */
+  routerEngines?: LlmRouterEngine[];
+  /** Model state changes behind the router, newest first, at most 10. In memory only. */
+  routerEvents?: LlmRouterEvent[];
+  /** Request outcomes over the last 24 h; null until the first activity read succeeds. */
+  routerActivity?: LlmRouterActivity | null;
+  /** Configured models (aliases excluded), sorted by id. */
+  routerModels?: LlmRouterModel[];
+  /** Engine identity (`model@processStart`); changes on every swap/restart. */
+  engineId?: string | null;
   /**
    * Observational exposure hint from unauthenticated probe reachability +
    * configured target host scope. null when auth status is unknown.
    * Does not claim process bind address.
    */
   posture?: LlmPosture | null;
+  /** The resident ComfyUI video studio (it holds the GPU lease), when there is one. */
+  studio?: { model: string; name: string | null } | null;
   error: string | null;
 }
 
-/** One UTC day of busy tok/s rollups (null avg = no busy samples). */
-export interface LlmDailyDay {
-  date: string;
-  decodeMax: number;
-  decodeAvg: number | null;
-  prefillMax: number;
-  prefillAvg: number | null;
-  cachedPrefillMax: number | null;
-  cachedPrefillAvg: number | null;
-  uncachedPrefillMax: number | null;
-  uncachedPrefillAvg: number | null;
+/** One UTC hour of generated-token volume. `hour` is "YYYY-MM-DDTHH". */
+export interface LlmHourlyBucket {
+  hour: string;
+  tokens: number;
 }
 
-export interface LlmDailyResponse {
+export interface LlmHourlyResponse {
   sparkId: string;
   port: number;
-  days: LlmDailyDay[];
+  hours: LlmHourlyBucket[];
 }
 
 /** Security posture badge payload from LlmProbe. */
@@ -491,6 +678,56 @@ export interface SparkMetrics {
   comfy?: ComfyMetrics | null;
   /** Tailnet probe result when monitoring is enabled; null when off or not yet polled. */
   tailscale?: TailscaleMetrics | null;
+  /** Video-studio (ComfyUI behind llama-swap) state; absent when the LLM endpoint is not a llama-swap router. */
+  video?: VideoMetrics;
+  /** Host health (pressure, NVMe, PCIe, kernel GPU errors, units, containers, Wi-Fi); absent until first poll. */
+  hostHealth?: HostHealthMetrics | null;
+}
+
+export interface PsiStat {
+  someAvg10: number;
+  someAvg60: number;
+  /** null for /proc/pressure/cpu on kernels that do not report `full`. */
+  fullAvg60: number | null;
+}
+
+export interface HostHealthMetrics {
+  available: boolean;
+  level: "ok" | "warn" | "crit";
+  /** Human-readable causes of a warn/crit level, most severe first. */
+  reasons: string[];
+  psi: { cpu: PsiStat | null; memory: PsiStat | null; io: PsiStat | null };
+  load: [number, number, number] | null;
+  swap: { totalMb: number; usedMb: number } | null;
+  nvme: {
+    device: string;
+    tempC: number | null;
+    percentUsed: number | null;
+    writtenTB: number | null;
+    unsafeShutdowns: number | null;
+    mediaErrors: number | null;
+    criticalWarning: number | null;
+    powerOnHours: number | null;
+  } | null;
+  /** PCIe AER error totals since boot, summed over devices. */
+  pcieAer: { correctable: number; nonFatal: number; fatal: number } | null;
+  /** `NVRM: Xid` kernel lines in the last 24 h. */
+  xid24h: number | null;
+  lastXid: string | null;
+  failedUnits: string[];
+  containers: { name: string; state: string; status: string }[];
+  wifi: { iface: string; ssid: string | null; signalDbm: number | null; txMbps: number | null; rxMbps: number | null }[];
+  updatedAt: number;
+  error?: string;
+}
+
+/** GET /api/sparks/:id/history — long-term downsampled series. */
+export type HistoryRange = "1h" | "24h" | "7d";
+export interface HistoryResponse {
+  range: HistoryRange;
+  stepMs: number;
+  /** key (e.g. "gpu.usage", "llm:11434.tps") → [timestampMs, value|null] oldest first. */
+  series: Record<string, [number, number | null][]>;
 }
 
 // ─── Spark snapshot (server pushes this) ──────────────────
@@ -573,6 +810,25 @@ export interface FleetEnergy {
   hourlyWatts24h: Array<number | null>;
 }
 
+/**
+ * Sparkline history, sent once per connection ahead of the first snapshot.
+ *
+ * `series` is keyed `${sparkId}:${metric}` exactly as metricsStore keys its
+ * own Map — the server derives those keys in
+ * server/collectors/MetricsHistory.js and the two MUST stay in step.
+ * `max` is the server's cap, for reference; the client applies its own.
+ */
+export interface WsHistory {
+  type: "history";
+  series: Record<string, number[]>;
+  /** Per-series [firstSampleMs, lastSampleMs]. Optional: a server predating
+   *  the timing contract sends none, and the client falls back to cadence. */
+  meta?: Record<string, number[]>;
+  max: number;
+}
+
+export type WsMessage = WsSnapshot | WsHistory;
+
 // ─── API responses ────────────────────────────────────────
 export interface Settings {
   pollIntervalMs: number;
@@ -594,6 +850,8 @@ export interface Settings {
   showLlmTokenTotals: boolean;
   /** Benchmark dialogs offer "Copy image" — a PNG share card of the results. */
   benchShareImage: boolean;
+  /** Services cards — side-by-side grid (default) or full-width rows. */
+  servicesLayout: "grid" | "rows";
 }
 
 export interface SparksListResponse {

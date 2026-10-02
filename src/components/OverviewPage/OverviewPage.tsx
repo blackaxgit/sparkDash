@@ -9,6 +9,9 @@ import { FleetAlertStrip } from "./FleetAlertStrip";
 import { FleetTokenTotals } from "./FleetTokenTotals";
 import { ActivityIcon, PowerOffIcon, PowerOnIcon, RotateIcon } from "../ui/icons";
 import { formatMb } from "../../shared/formatBytes";
+import { celsiusToFahrenheit, tempFormatter } from "../../shared/temperature";
+import { Sparkline } from "../ui/Sparkline";
+import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 
 interface OverviewPageProps {
   sparks: SparkSnapshot[];
@@ -22,12 +25,6 @@ interface OverviewPageProps {
   temperatureUnit?: "celsius" | "fahrenheit";
   onSelectSpark?: (id: string) => void;
 }
-
-function celsiusToFahrenheit(c: number): number {
-  return Math.round(c * 9 / 5 + 32);
-}
-
-
 
 /** Format a storage value in MB, stripping trailing ".0" and optionally omitting the unit. */
 function fmtStorage(mb: number, unit: boolean): string {
@@ -94,6 +91,8 @@ function SparkCard({
   const gpu = spark.metrics.gpu;
   const um = spark.metrics.unifiedMemory;
   const online = spark.online;
+  const gpuUsageHistory = useMetricsHistoryTail(spark.id, "gpu.usage");
+  const gpuTempHistory = useMetricsHistoryTail(spark.id, "gpu.temp");
 
   const usage = gpu?.usage ?? 0;
   const tempRaw = gpu?.temperature ?? 0;
@@ -194,6 +193,31 @@ function SparkCard({
                   : "Comfy · idle"}
           </span>
         ) : null}
+        {spark.metrics?.video?.available ? (() => {
+          const video = spark.metrics.video;
+          const waiting = video.llmWait?.waiting ?? 0;
+          const studioLabel = video.studio?.name ?? video.studio?.model ?? "video studio";
+          const status = video.active
+            ? "rendering"
+            : video.studio?.state === "loading"
+              ? "loading"
+              : video.studio?.state === "ready"
+                ? "idle"
+                : "unloaded";
+          const chipClass = video.active
+            ? "bg-accent/15 text-accent"
+            : waiting > 0
+              ? "bg-warning/15 text-warning"
+              : "bg-border/60 text-muted";
+          return (
+            <span
+              className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${chipClass}`}
+              title={`${studioLabel} — ${status}${waiting > 0 ? `, ${waiting} LLM request${waiting === 1 ? "" : "s"} waiting` : ""}`}
+            >
+              {video.active ? "Video · run" : waiting > 0 ? `Video · ${waiting} wait` : "Video"}
+            </span>
+          );
+        })() : null}
         <span className="text-[10px] uppercase tracking-wide text-muted">
           {online ? "online" : "offline"}
         </span>
@@ -262,12 +286,28 @@ function SparkCard({
                 />
               );
             })()}
-            {gpu?.throttle?.thermal && (
+            {(gpu?.throttle?.thermal || gpu?.thermal?.level === "crit") && (
               <div
                 className="rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] font-medium text-danger"
-                title={gpu.throttle.detail || "GPU thermal slowdown engaged"}
+                title={
+                  gpu.throttle?.thermal
+                    ? gpu.throttle.detail || "GPU thermal slowdown engaged"
+                    : gpu.thermal?.reasons?.join("; ") || "GPU thermal limit reached"
+                }
               >
-                Thermal throttle
+                {gpu.throttle?.thermal ? "Thermal throttle" : "Thermal critical"}
+                {!gpu.throttle?.thermal && gpu.thermal?.reasons?.[0]
+                  ? ` · ${gpu.thermal.reasons[0]}`
+                  : ""}
+              </div>
+            )}
+            {!gpu?.throttle?.thermal && gpu?.thermal?.level === "warn" && (
+              <div
+                className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] font-medium text-warning"
+                title={gpu.thermal.reasons?.join("; ") || "GPU running hot"}
+              >
+                Thermal warning
+                {gpu.thermal.reasons?.[0] ? ` · ${gpu.thermal.reasons[0]}` : ""}
               </div>
             )}
             <MetricBar
@@ -277,6 +317,32 @@ function SparkCard({
               color={usageBarColor}
               caption={`${usage}%`}
             />
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="text-[10px] tracking-wide text-muted">GPU %</span>
+              <div className="min-w-0 flex-1">
+                <Sparkline
+                  data={gpuUsageHistory}
+                  height={16}
+                  stretch
+                  unit="%"
+                  ariaLabel="GPU usage history"
+                />
+              </div>
+            </div>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="text-[10px] tracking-wide text-muted">Temp</span>
+              <div className="min-w-0 flex-1">
+                <Sparkline
+                  data={gpuTempHistory}
+                  height={16}
+                  stretch
+                  format={tempFormatter(temperatureUnit)}
+                  ariaLabel={`GPU temperature history (°${temperatureUnit === "fahrenheit" ? "F" : "C"})`}
+                />
+              </div>
+            </div>
           </div>
 
           {/* Secondary stats */}

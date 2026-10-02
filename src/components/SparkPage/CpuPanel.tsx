@@ -3,6 +3,7 @@ import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { CpuIcon } from "../ui/icons";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
+import { celsiusToFahrenheit } from "../../shared/temperature";
 
 interface CpuPanelProps {
   cpu: CpuMetrics | null;
@@ -10,10 +11,6 @@ interface CpuPanelProps {
   sparkId: string;
   temperatureUnit: "celsius" | "fahrenheit";
   className?: string;
-}
-
-function celsiusToFahrenheit(c: number): number {
-  return Math.round((c * 9) / 5 + 32);
 }
 
 function MetricRow({

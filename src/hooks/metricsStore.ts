@@ -8,9 +8,13 @@ import { TimedRingBuffer, type TimedSample } from "./ringBuffer";
  * Fed once per WebSocket snapshot by useSnapshot. Components read time-series
  * via `useMetricsHistory` / `useMetricsHistoryTail` — a single source of truth that:
  *   - survives Spark tab switches (history is no longer per-panel useState),
- *   - caps each series at HISTORY_MAX samples (1 h at the default 2 s poll),
+ *   - caps each series at HISTORY_MAX samples,
  *   - lets future time-range charts read from one place,
  *   - keeps sparklines on a short tail (SPARKLINE_TAIL) so 84px charts stay readable.
+ *
+ * Seeded on connect by `hydrateHistory` from the server's ring buffer
+ * (server/collectors/MetricsHistory.js), so the charts open with real history
+ * instead of filling up from an empty tab at one sample per second.
  *
  * Also keeps the latest snapshot per spark (`getSpark` / `useSpark`) as the
  * selective-subscription seam (#8a).
@@ -20,6 +24,13 @@ import { TimedRingBuffer, type TimedSample } from "./ringBuffer";
  * actually changed. On each ingest we replace the history array with a new ref
  * (slice + append), so subscribers to that key re-render and all others skip.
  * All listeners are woken on notify; unchanged keys keep the same ref → no render.
+ *
+ * TIMING CONTRACT: every sample carries its own timestamp (TimedRingBuffer), so
+ * `useSeriesStart` can report how much wall-clock time a chart actually spans.
+ * Sample count alone cannot: an offline host stops contributing samples while
+ * time keeps passing, so `length x pollInterval` would under-report the age of
+ * the leftmost point. Hydrated series get timestamps interpolated between the
+ * server's [first, last] pair (`timesForHydrated`).
  */
 
 // History depth, configurable at build time. VITE_HISTORY_HOURS = wall-clock
@@ -30,6 +41,8 @@ const HISTORY_HOURS = Number(import.meta.env.VITE_HISTORY_HOURS ?? 8) || 8;
 export const HISTORY_MAX = Math.round(SAMPLES_PER_HOUR * HISTORY_HOURS);
 /** Samples shown in inline sparklines (≈1 min at 2 s poll). Full series stays in HISTORY_MAX. */
 export const SPARKLINE_TAIL = 30;
+/** Cadence assumed only when the server sent no timing metadata for a series. */
+const FALLBACK_STEP_MS = 1000;
 
 const history = new Map<string, TimedRingBuffer>(); // key: `${sparkId}:${metric}`
 const historySamples = new Map<string, readonly TimedSample[]>();
@@ -107,9 +120,68 @@ function removeHistoryForSpark(sparkId: string) {
   }
 }
 
+/**
+ * Rebuild per-sample timestamps for a hydrated series from the server's
+ * [first, last] pair. Both endpoints are real readings, so the age label — the
+ * only consumer — is exact; the interpolated interior is replaced by real
+ * timestamps as new samples arrive.
+ */
+function timesForHydrated(n: number, pair: readonly number[] | undefined): number[] {
+  const t0 = pair?.[0];
+  const tLast = pair?.[1];
+  if (typeof t0 !== "number" || typeof tLast !== "number" || !(tLast >= t0)) {
+    const end = Date.now();
+    return Array.from({ length: n }, (_, i) => end - (n - 1 - i) * FALLBACK_STEP_MS);
+  }
+  if (n === 1) return [tLast];
+  const step = (tLast - t0) / (n - 1);
+  return Array.from({ length: n }, (_, i) => Math.round(t0 + i * step));
+}
+
+/**
+ * Seed series from the server's ring buffer, sent once per WS connection.
+ *
+ * Keys are produced by the server key-for-key with `ingestSnapshots` below;
+ * anything unrecognized is simply never read.
+ *
+ * A shorter server series never replaces a longer local one. That matters on
+ * reconnect: the tab may already hold samples the server lost to a restart,
+ * and overwriting them would visibly shorten a chart that was full a second
+ * earlier. When the server has more, it is strictly the better source — it
+ * spans page loads and other tabs.
+ */
+export function hydrateHistory(
+  series: Record<string, number[]> | undefined,
+  meta?: Record<string, number[]>
+): void {
+  if (!series || typeof series !== "object") return;
+  let changed = false;
+
+  for (const [key, raw] of Object.entries(series)) {
+    if (!Array.isArray(raw)) continue;
+    const clean = raw.filter((v) => typeof v === "number" && Number.isFinite(v));
+    if (clean.length === 0) continue;
+    const existing = historySamples.get(key);
+    if (existing && existing.length >= clean.length) continue;
+    const next = clean.length > HISTORY_MAX ? clean.slice(-HISTORY_MAX) : clean;
+    const times = timesForHydrated(next.length, meta?.[key]);
+    const ring = new TimedRingBuffer(HISTORY_MAX);
+    for (let i = 0; i < next.length; i++) ring.push({ at: times[i], value: next[i] });
+    history.set(key, ring);
+    const samples = ring.toArray();
+    historySamples.set(key, samples);
+    historyValues.set(key, next);
+    setHistoryTail(key, next);
+    changed = true;
+  }
+
+  if (changed) notify();
+}
+
 /** Ingest a full WS snapshot: update latest-per-spark + append history series. */
 export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void {
   const alive = new Set<string>();
+  // `at` is one timestamp for the whole frame, so every series on a panel agrees.
 
   for (const s of sparks) {
     alive.add(s.id);
@@ -205,6 +277,11 @@ function getHistoryTail(key: string): readonly number[] {
   return historyTails.get(key) ?? EMPTY;
 }
 
+function getSeriesStartMs(key: string): number | undefined {
+  const samples = historySamples.get(key);
+  return samples && samples.length ? samples[0].at : undefined;
+}
+
 /**
  * Subscribe to one metric's full history series for one spark (up to HISTORY_MAX).
  * Re-renders only when that specific (sparkId, metric) array ref changes.
@@ -237,6 +314,22 @@ export function useMetricsHistoryTail(sparkId: string, metric: string): readonly
     subscribeMetrics,
     () => getHistoryTail(key),
     () => EMPTY
+  );
+}
+
+/**
+ * Timestamp of the leftmost drawn sample, or undefined when the series is
+ * empty. Deliberately returns the fixed start rather than an age: an age would
+ * be a new number on every getSnapshot call, which useSyncExternalStore treats
+ * as a changed store and re-renders forever. Callers subtract from Date.now()
+ * at render time — renders already happen once per snapshot.
+ */
+export function useSeriesStart(sparkId: string, metric: string): number | undefined {
+  const key = `${sparkId}:${metric}`;
+  return useSyncExternalStore(
+    subscribeMetrics,
+    () => getSeriesStartMs(key),
+    () => undefined
   );
 }
 

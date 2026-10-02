@@ -3,9 +3,11 @@ import type {
   DecodeBenchListResponse,
   FleetEnergy,
   HermesBatchUpdateResponse,
+  HistoryRange,
+  HistoryResponse,
   HermesUpdatesResponse,
   LlmMetrics,
-  LlmDailyResponse,
+  LlmHourlyResponse,
   Settings,
   ShowcaseListResponse,
   ShowcaseSessionState,
@@ -60,14 +62,14 @@ export function fetchSparkMetrics(id: string): Promise<{
   return apiFetch(`/api/sparks/${id}/metrics`);
 }
 
-/** Daily busy tok/s rollups for one Spark LLM port. */
-export function fetchLlmDaily(
+/** Hourly generated-token volume for one Spark LLM port. */
+export function fetchLlmHourly(
   id: string,
   port: number,
-  days = 14
-): Promise<LlmDailyResponse> {
-  const q = new URLSearchParams({ port: String(port), days: String(days) });
-  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/llm/daily?${q.toString()}`);
+  hours = 24
+): Promise<LlmHourlyResponse> {
+  const q = new URLSearchParams({ port: String(port), hours: String(hours) });
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/llm/hourly?${q.toString()}`);
 }
 
 export function addSpark(config: SparkConfig): Promise<{ success: boolean; spark: SparkConfig }> {
@@ -126,6 +128,17 @@ export function testSparkConfig(config: Omit<SparkConfig, "id"> & { id?: string 
   });
 }
 
+/** Stop the running render or remove a pending job from the video studio queue. */
+export function cancelVideoJob(
+  sparkId: string,
+  promptId: string
+): Promise<{ success: boolean; ok?: boolean; method?: string; message?: string }> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(sparkId)}/video/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ promptId }),
+  });
+}
+
 /** Cancel a ComfyUI job (interrupt running and/or remove from queue). */
 export function cancelComfyJob(
   sparkId: string,
@@ -134,6 +147,30 @@ export function cancelComfyJob(
   return apiFetch(`/api/sparks/${encodeURIComponent(sparkId)}/comfy/cancel`, {
     method: "POST",
     body: JSON.stringify({ promptId }),
+  });
+}
+
+/** Unload a model resident behind a llama-swap router. */
+export function routerUnload(
+  sparkId: string,
+  port: number,
+  model: string
+): Promise<{ success: boolean }> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(sparkId)}/llm/router/unload`, {
+    method: "POST",
+    body: JSON.stringify({ port, model }),
+  });
+}
+
+/** Start a cold load of a router model (202; progress shows in `routerLoading`). */
+export function routerLoad(
+  sparkId: string,
+  port: number,
+  model: string
+): Promise<{ success: boolean; status: "loading" }> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(sparkId)}/llm/router/load`, {
+    method: "POST",
+    body: JSON.stringify({ port, model }),
   });
 }
 
@@ -441,4 +478,10 @@ export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
     method: "PUT",
     body: JSON.stringify(patch),
   });
+}
+
+// ─── Long-term history ────────────────────────────────────
+/** Downsampled per-minute / 10-minute metric series for one Spark. */
+export function fetchHistory(sparkId: string, range: HistoryRange): Promise<HistoryResponse> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(sparkId)}/history?range=${range}`);
 }

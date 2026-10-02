@@ -29,7 +29,6 @@ async function startServer(t) {
       SPARKS_JSON_PATH: path.join(tmp, "sparks.json"),
       SPARKS_SECRETS_PATH: path.join(tmp, "sparks-secrets.json"),
       SECRETS_KEY_PATH: path.join(tmp, ".secrets-key"),
-      LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],

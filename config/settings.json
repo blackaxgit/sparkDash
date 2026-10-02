@@ -4,5 +4,6 @@
   "autoHideOffline": false,
   "temperatureUnit": "celsius",
   "benchDebugTraces": false,
-  "density": "compact"
+  "density": "compact",
+  "servicesLayout": "grid"
 }

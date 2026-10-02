@@ -15,15 +15,15 @@ const SPARKS_SECRETS_PATH =
 /** AES key file (auto-generated if SPARKDASH_SECRETS_KEY unset). */
 const SECRETS_KEY_PATH =
   process.env.SECRETS_KEY_PATH || path.join(ROOT, "config", ".secrets-key");
-/** Daily LLM tok/s rollups (gitignored). */
-const LLM_DAILY_JSON_PATH =
-  process.env.LLM_DAILY_JSON_PATH || path.join(ROOT, "config", "llm-daily.json");
 /** Cumulative LLM token totals per model (gitignored). */
 const LLM_TOKEN_JSON_PATH =
   process.env.LLM_TOKEN_JSON_PATH || path.join(ROOT, "config", "llm-token-totals.json");
 /** Rolling fleet energy estimates (gitignored; written atomically at mode 0600). */
 const FLEET_ENERGY_JSON_PATH =
   process.env.FLEET_ENERGY_JSON_PATH || path.join(ROOT, "config", "fleet-energy.json");
+/** Hourly LLM generated-token volume (gitignored). */
+const LLM_HOURLY_JSON_PATH =
+  process.env.LLM_HOURLY_JSON_PATH || path.join(ROOT, "config", "llm-hourly.json");
 
 // ─── LLM / Comfy probe timeouts ──────────────────────────
 const LLM_PROBE_TIMEOUT_MS = 3000;
@@ -42,6 +42,10 @@ const POLL_INTERVAL_NETWORK = parseInt(process.env.POLL_INTERVAL_NETWORK || "200
 const POLL_INTERVAL_STORAGE = parseInt(process.env.POLL_INTERVAL_STORAGE || "5000", 10);
 const POLL_INTERVAL_LLM = parseInt(process.env.POLL_INTERVAL_LLM || "2000", 10);
 const POLL_INTERVAL_COMFY = parseInt(process.env.POLL_INTERVAL_COMFY || "2000", 10);
+// Video studio (ComfyUI behind llama-swap) queue/progress; local HTTP only, no SSH.
+const POLL_INTERVAL_VIDEO = parseInt(process.env.POLL_INTERVAL_VIDEO || "3000", 10);
+// Host health (PSI, NVMe SMART, PCIe AER, Xid, failed units, containers, Wi-Fi): one SSH round-trip.
+const POLL_INTERVAL_HOST_HEALTH = parseInt(process.env.POLL_INTERVAL_HOST_HEALTH || "60000", 10);
 // Tailnet membership changes slowly; each poll is an SSH round-trip.
 const POLL_INTERVAL_TAILSCALE = parseInt(process.env.POLL_INTERVAL_TAILSCALE || "30000", 10);
 // Kernel journal scan for NV_ERR_NO_MEMORY — not on the 2s GPU loop.
@@ -106,9 +110,9 @@ export {
   GPU_MEMORY_JSON_PATH,
   SPARKS_SECRETS_PATH,
   SECRETS_KEY_PATH,
-  LLM_DAILY_JSON_PATH,
   LLM_TOKEN_JSON_PATH,
   FLEET_ENERGY_JSON_PATH,
+  LLM_HOURLY_JSON_PATH,
   LLM_PROBE_TIMEOUT_MS,
   COMFY_PROBE_TIMEOUT_MS,
   TAILSCALE_PROBE_TIMEOUT_MS,
@@ -120,6 +124,8 @@ export {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
+  POLL_INTERVAL_VIDEO,
+  POLL_INTERVAL_HOST_HEALTH,
   POLL_INTERVAL_TAILSCALE,
   POLL_INTERVAL_NVERR,
   POLL_INTERVAL_BANDWIDTH,

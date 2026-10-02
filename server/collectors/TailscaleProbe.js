@@ -7,10 +7,8 @@
  *
  * Command: `tailscale status --json` (read-only).
  */
-import { TAILSCALE_PROBE_TIMEOUT_MS, HOST_PATHS } from "../config.js";
-import { sshExec } from "./ssh.js";
-import fs from "fs";
-import path from "path";
+import { TAILSCALE_PROBE_TIMEOUT_MS } from "../config.js";
+import { sshExec, execHostLocal } from "./ssh.js";
 
 /**
  * @param {unknown} v
@@ -75,10 +73,6 @@ export class TailscaleProbe {
 
   dispose() {}
 
-  _hasHostProc() {
-    return fs.existsSync(path.join(HOST_PATHS.PROC, "1", "ns", "mnt"));
-  }
-
   /**
    * Local Docker: tailscaled's socket lives on the host, so enter the host
    * mount namespace (same approach as nvidia-smi).
@@ -86,18 +80,7 @@ export class TailscaleProbe {
    * @returns {Promise<string>}
    */
   async _execLocal(cmd) {
-    const { execFile } = await import("child_process");
-    const useHostNs = this._hasHostProc();
-    const file = useHostNs ? "nsenter" : "sh";
-    const args = useHostNs
-      ? ["--mount=" + path.join(HOST_PATHS.PROC, "1", "ns", "mnt"), "--", "sh", "-c", cmd]
-      : ["-c", cmd];
-    return new Promise((resolve, reject) => {
-      execFile(file, args, { timeout: TAILSCALE_PROBE_TIMEOUT_MS }, (err, stdout, stderr) => {
-        if (err) return reject(new Error(String(stderr || "").trim() || err.message));
-        resolve(String(stdout).trim());
-      });
-    });
+    return execHostLocal(cmd, { timeoutMs: TAILSCALE_PROBE_TIMEOUT_MS });
   }
 
   /**

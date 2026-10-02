@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useSnapshot } from "./hooks/useSnapshot";
 import { useAppRoute, useRoute } from "./hooks/useRoute";
-import { fetchSparks, reorderSparks, fetchSettings } from "./api/client";
+import { fetchSparks, reorderSparks, fetchSettings, updateSettings } from "./api/client";
 import { SparkTabs } from "./components/SparkTabs";
 import { AddSparkDialog } from "./components/AddSparkDialog";
 import { EditSparkDialog } from "./components/EditSparkDialog";
@@ -219,6 +219,14 @@ function DashboardApp() {
     setSettings(s);
   }, []);
 
+  const handleServicesLayoutChange = useCallback((next: "grid" | "rows") => {
+    // Optimistic: the toggle should feel instant, the write is a round trip.
+    setSettings((prev) => (prev ? { ...prev, servicesLayout: next } : prev));
+    updateSettings({ servicesLayout: next })
+      .then(setSettings)
+      .catch((err) => console.error("Failed to save services layout:", err));
+  }, []);
+
   // Apply layout density (comfortable/compact) from persisted settings.
   useEffect(() => {
     if (settings?.density) {
@@ -363,6 +371,8 @@ function DashboardApp() {
               spark={displayActive}
               temperatureUnit={settings?.temperatureUnit ?? "celsius"}
               benchShareImage={settings?.benchShareImage ?? false}
+              servicesLayout={settings?.servicesLayout ?? "grid"}
+              onServicesLayoutChange={handleServicesLayoutChange}
               onEdit={() => setEditId(displayActive.id)}
             />
           ) : (

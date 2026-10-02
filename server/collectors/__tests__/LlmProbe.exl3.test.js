@@ -160,7 +160,8 @@ test("probe: exl3 path does not mislabel as vllm", async (t) => {
   };
   const snap = await probe.probe();
   assert.equal(snap.backend, "exl3");
-  assert.equal(snap.generationTps, 20);
-  assert.equal(snap.prefillTps, 20);
+  // dt comes from the wall clock, so assert the rate, not a float identity.
+  assert.ok(Math.abs(snap.generationTps - 20) < 0.5, `generationTps ${snap.generationTps}`);
+  assert.ok(Math.abs(snap.prefillTps - 20) < 0.5, `prefillTps ${snap.prefillTps}`);
   assert.equal(snap.available, true);
 });
