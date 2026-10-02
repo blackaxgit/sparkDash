@@ -1,12 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { LlmMetrics } from "../../api/types";
+import type { LlmMetrics, VideoLlmWait } from "../../api/types";
 import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
 import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
-import { useMetricsHistoryTail } from "../../hooks/metricsStore";
+import { useMetricsHistory, useSeriesStart } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { LlmHourlyChart } from "./LlmHourlyChart";
+
+/**
+ * Wall-clock span of a chart, for the age axis. Whole units only: the axis
+ * answers "seconds or an hour?", and a second of precision on a 40-minute
+ * chart is noise that changes on every frame.
+ */
+function formatAge(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest ? `${h} h ${rest} min` : `${h} h`;
+}
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
@@ -16,6 +31,8 @@ interface LlmPanelProps {
   hasApiKey?: boolean;
   onRemovePort?: (port: number) => void;
   className?: string;
+  /** Requests queued in llama-swap for an unloaded chat model (spark.metrics.video?.llmWait). */
+  llmWait?: VideoLlmWait | null;
 }
 
 const VLLM_METRIC_INFO = {
@@ -37,10 +54,18 @@ const VLLM_METRIC_INFO = {
     "Lifetime speculative / MTP acceptance rate (accepted draft tokens ÷ drafted tokens). Higher means speculative decoding is paying off; — when speculation is off or unused.",
 } as const;
 
-/** Backend badge — neutral surfaces with a single accent dot. No blue/purple. */
-function BackendBadge({ backend }: { backend: string | null }) {
-  if (!backend) return <span className="text-xs text-muted">No backend</span>;
-
+/**
+ * Backend badge — neutral surfaces with a single accent dot. No blue/purple.
+ * `router` names the proxy in front of the engine (llama-swap), because on a
+ * router port the engine changes under the same port as models swap.
+ */
+function BackendBadge({
+  backend,
+  router,
+}: {
+  backend: string | null;
+  router?: string | null;
+}) {
   const labels: Record<string, string> = {
     vllm: "vLLM",
     "llama.cpp": "llama.cpp",
@@ -50,10 +75,22 @@ function BackendBadge({ backend }: { backend: string | null }) {
   };
 
   return (
-    <span className="llm-badge">
-      <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-      {labels[backend] || backend}
-    </span>
+    <>
+      {backend ? (
+        <span className="llm-badge">
+          <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+          {labels[backend] || backend}
+        </span>
+      ) : (
+        <span className="text-xs text-muted">No backend</span>
+      )}
+      {router && (
+        <span className="llm-badge" title={`Model router on this port (${router})`}>
+          <span className="h-1.5 w-1.5 rounded-full bg-muted" />
+          {router}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -155,12 +192,19 @@ export function LlmPanel({
   hasApiKey = false,
   onRemovePort,
   className,
+  llmWait,
 }: LlmPanelProps) {
   // Tail keyed by port so multi-port LLM sparklines stay distinct (8b).
-  const genHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.tps`);
-  const prefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefill`);
-  const cachedPrefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefillCached`);
-  const uncachedPrefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefillUncached`);
+  const genHistory = useMetricsHistory(sparkId, `llm:${llmPort}.tps`);
+  // Age axis reads the generation series: it is the one metric always present
+  // on an LLM panel, and every row of the panel is sampled in the same tick.
+  const genStart = useSeriesStart(sparkId, `llm:${llmPort}.tps`);
+  const prefillHistory = useMetricsHistory(sparkId, `llm:${llmPort}.prefill`);
+  const cachedPrefillHistory = useMetricsHistory(sparkId, `llm:${llmPort}.prefillCached`);
+  const uncachedPrefillHistory = useMetricsHistory(
+    sparkId,
+    `llm:${llmPort}.prefillUncached`
+  );
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -298,10 +342,27 @@ export function LlmPanel({
         </div>
       }
     >
+      {llm?.studio && (
+        <div
+          role="status"
+          className="mb-3 rounded border border-warning/40 bg-warning/15 px-3 py-2 text-xs font-medium text-warning"
+          title="A ComfyUI video studio is resident in llama-swap's exclusive group, so chat models are unloaded and LLM requests wait until it is released."
+        >
+          <div>
+            GPU held by video studio {llm.studio.name ?? llm.studio.model} — chat models unloaded
+          </div>
+          {llmWait != null && llmWait.waiting > 0 && (
+            <div className="mt-0.5 font-tabular font-normal">
+              {llmWait.waiting} request{llmWait.waiting === 1 ? "" : "s"} waiting
+              {llmWait.oldestMs != null ? ` (oldest ${formatAge(llmWait.oldestMs)})` : ""}
+            </div>
+          )}
+        </div>
+      )}
       {showSettings ? (
         <div className="space-y-3">
           <p className="text-[10px] text-muted">
-            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / OpenAI-compatible gateway).
+            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / llama-swap / OpenAI-compatible gateway).
           </p>
           <label className="block space-y-1">
             <span className="text-xs text-muted">Port</span>
@@ -402,7 +463,11 @@ export function LlmPanel({
             <p className="text-xs text-muted">
               {llm?.posture?.auth === "protected"
                 ? `${llm.posture.label} on :${llmPort}`
-                : `No model loaded on :${llmPort}`}
+                : llm?.routerLoading
+                  ? `Loading ${llm.routerLoading} on :${llmPort}…`
+                  : llm?.router
+                    ? `${llm.router} idle on :${llmPort} — no model resident`
+                    : `No model loaded on :${llmPort}`}
             </p>
           </div>
           <div className="border-t border-border pt-3 space-y-2">
@@ -429,8 +494,16 @@ export function LlmPanel({
       ) : (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <BackendBadge backend={llm?.backend ?? null} />
+            <BackendBadge backend={llm?.backend ?? null} router={llm?.router ?? null} />
             {llm?.posture && <PostureBadge posture={llm.posture} />}
+            {llm?.routerLoading && llm.routerLoading !== llm.routerModel && (
+              <span
+                className="shrink-0 text-[10px] text-muted"
+                title="A second model is cold-starting behind the router"
+              >
+                loading {llm.routerLoading}…
+              </span>
+            )}
             {llm?.modelId && (
               <span
                 className="min-w-0 flex-1 whitespace-normal break-words text-xs leading-snug text-text [overflow-wrap:anywhere]"
@@ -449,69 +522,146 @@ export function LlmPanel({
             </div>
           )}
 
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-muted">Generation tok/s</span>
-            <div className="flex items-center gap-2">
-              <Sparkline data={genHistory} color="var(--color-accent)" height={24} />
-              <span className="font-tabular text-sm font-semibold text-accent">
-                {generationTps.toFixed(1)}
-              </span>
+          <div className="flex items-center gap-3">
+            <span className="w-40 shrink-0 text-xs text-muted">Generation tok/s</span>
+            <div className="min-w-0 flex-1">
+              <Sparkline data={genHistory} color="var(--color-accent)" width={1800} height={48} stretch />
             </div>
+            <span className="w-16 shrink-0 text-right font-tabular text-sm font-semibold text-accent">
+              {generationTps.toFixed(1)}
+            </span>
           </div>
           <div
-            className="flex items-center justify-between"
+            className="flex items-center gap-3"
             title="Tokens/sec while the engine is reading the prompt and building KV cache — before the first output token. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Prefix-cache hits do little compute, so this can stay ~0. Long cold prefills show here until decode starts."
           >
-            <span className="text-xs text-muted">Prefill tok/s</span>
-            <div className="flex items-center gap-2">
-              <Sparkline data={prefillHistory} color="var(--color-text)" height={24} />
-              <span className="font-tabular text-sm font-semibold text-text">
-                {prefillTps.toFixed(1)}
-              </span>
+            <span className="w-40 shrink-0 text-xs text-muted">Prefill tok/s</span>
+            <div className="min-w-0 flex-1">
+              <Sparkline data={prefillHistory} color="var(--color-text)" width={1800} height={48} stretch />
             </div>
+            <span className="w-16 shrink-0 text-right font-tabular text-sm font-semibold text-text">
+              {prefillTps.toFixed(1)}
+            </span>
           </div>
           {showPrefillSplit && (
             <>
               <div
-                className="flex items-center justify-between"
+                className="flex items-center gap-3"
                 title="Prefill tokens served from prefix cache (little GPU work). High values mean prompt reuse, not a faster cold prefill."
               >
-                <span className="text-xs text-muted">Cached prefill tok/s</span>
-                <div className="flex items-center gap-2">
-                  <Sparkline data={cachedPrefillHistory} color="var(--color-muted)" height={24} />
-                  <span className="font-tabular text-sm font-semibold text-muted">
-                    {cachedPrefillTps.toFixed(1)}
-                  </span>
+                <span className="w-40 shrink-0 text-xs text-muted">Cached prefill tok/s</span>
+                <div className="min-w-0 flex-1">
+                  <Sparkline data={cachedPrefillHistory} color="var(--color-muted)" width={1800} height={48} stretch />
                 </div>
+                <span className="w-16 shrink-0 text-right font-tabular text-sm font-semibold text-muted">
+                  {cachedPrefillTps.toFixed(1)}
+                </span>
               </div>
               <div
-                className="flex items-center justify-between"
+                className="flex items-center gap-3"
                 title="Uncached (computed) prefill — tokens that actually build KV cache on the GPU."
               >
-                <span className="text-xs text-muted">Uncached prefill tok/s</span>
-                <div className="flex items-center gap-2">
-                  <Sparkline data={uncachedPrefillHistory} color="var(--color-text)" height={24} />
-                  <span className="font-tabular text-sm font-semibold text-text">
-                    {uncachedPrefillTps.toFixed(1)}
-                  </span>
+                <span className="w-40 shrink-0 text-xs text-muted">Uncached prefill tok/s</span>
+                <div className="min-w-0 flex-1">
+                  <Sparkline data={uncachedPrefillHistory} color="var(--color-text)" width={1800} height={48} stretch />
                 </div>
+                <span className="w-16 shrink-0 text-right font-tabular text-sm font-semibold text-text">
+                  {uncachedPrefillTps.toFixed(1)}
+                </span>
               </div>
             </>
           )}
 
+          {/*
+            Chart-age axis. Sparkline stretches N points to the full width, so
+            a chart holding 12 s and one holding an hour are pixel-identical.
+            Mirrors the hourly chart's "12 PM … now" axis and uses the same
+            three-column geometry as the rows above, so the left label sits at
+            the true left edge of the plotted area.
+          */}
+          {genStart != null && genHistory.length > 1 && (
+            <div className="flex items-center gap-3">
+              <span className="w-40 shrink-0" aria-hidden />
+              <div className="flex min-w-0 flex-1 justify-between text-[10px] text-muted">
+                <span title={`Oldest sample: ${new Date(genStart).toLocaleTimeString()} · ${genHistory.length} samples`}>
+                  {formatAge(Date.now() - genStart)} ago
+                </span>
+                <span>now</span>
+              </div>
+              <span className="w-16 shrink-0" aria-hidden />
+            </div>
+          )}
+
             <LlmHourlyChart sparkId={sparkId} llmPort={llmPort} />
 
-          <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Slots</div>
-              <div className="font-tabular text-sm text-text">
-                {(llm?.slotsTotal ?? 0) > 0
-                  ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
-                  : (llm?.slotsActive ?? 0) > 0
-                    ? `${llm?.slotsActive} running`
-                    : "—"}
+          {/*
+            More than one engine resident: the card's rates and totals describe
+            the followed one, so name every model that is holding memory with
+            its own tokens — otherwise a busy second model looks idle.
+          */}
+          {(llm?.routerEngines?.length ?? 0) > 1 && (
+            <div className="space-y-1 border-t border-border pt-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted">
+                Resident models
               </div>
+              {llm?.routerEngines?.map((e) => (
+                <div key={e.model} className="flex items-baseline gap-2 text-xs">
+                  <span
+                    className={`min-w-0 flex-1 truncate ${e.active ? "text-text" : "text-muted"}`}
+                    title={e.name ? `${e.name} · ${e.model}` : e.model}
+                  >
+                    {e.active && <span className="mr-1 text-accent">•</span>}
+                    {e.model}
+                  </span>
+                  <span
+                    className={`w-20 shrink-0 text-right font-tabular ${
+                      e.generationTps > 0 ? "text-accent" : "text-muted"
+                    }`}
+                    title="Live decode rate of this engine"
+                  >
+                    {e.generationTps.toFixed(1)} tok/s
+                  </span>
+                  <span
+                    className="w-24 shrink-0 text-right font-tabular text-muted"
+                    title="Tokens this engine has generated since it started"
+                  >
+                    {e.totalOutputTokens.toLocaleString()}
+                  </span>
+                </div>
+              ))}
             </div>
+          )}
+
+          <div className="grid grid-cols-4 gap-2 border-t border-border pt-3">
+            {/*
+              A router has no slot concept and vLLM does not export one, so the
+              tile would read "—" forever. On a single unified-memory pool the
+              honest number there is how many models are holding memory.
+            */}
+            {llm?.router && (llm?.slotsTotal ?? 0) === 0 ? (
+              <div className="space-y-0.5">
+                <div className="text-[10px] uppercase tracking-wide text-muted">Resident</div>
+                <div
+                  className="font-tabular text-sm text-text"
+                  title="Models loaded behind the router right now"
+                >
+                  {(llm?.routerResident ?? 0) > 0
+                    ? `${llm?.routerResident} model${llm?.routerResident === 1 ? "" : "s"}`
+                    : "—"}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-0.5">
+                <div className="text-[10px] uppercase tracking-wide text-muted">Slots</div>
+                <div className="font-tabular text-sm text-text">
+                  {(llm?.slotsTotal ?? 0) > 0
+                    ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
+                    : (llm?.slotsActive ?? 0) > 0
+                      ? `${llm?.slotsActive} running`
+                      : "—"}
+                </div>
+              </div>
+            )}
             <div className="space-y-0.5">
               <div className="text-[10px] uppercase tracking-wide text-muted">Context</div>
               <div className="font-tabular text-sm text-text">

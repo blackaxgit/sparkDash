@@ -47,6 +47,14 @@ export class LlmHourlyStore {
      * @type {Map<string, number>}
      */
     this._last = new Map();
+    /**
+     * Last engine identity per series. A llama-swap port serves a different
+     * process after every swap, and each one counts from zero — without this
+     * the new engine's backlog lands in the current hour as if it had just
+     * been generated.
+     * @type {Map<string, string|null>}
+     */
+    this._engine = new Map();
     this._dirty = false;
     this._flushTimer = null;
     this._load();
@@ -84,7 +92,7 @@ export class LlmHourlyStore {
   /**
    * @param {string} sparkId
    * @param {number} port
-   * @param {{ available?: boolean, cumulativeOutputTokens?: number|null }} metrics
+   * @param {{ available?: boolean, cumulativeOutputTokens?: number|null, engineId?: string|null }} metrics
    * @param {Date} [now]
    */
   record(sparkId, port, metrics, now = new Date()) {
@@ -102,6 +110,15 @@ export class LlmHourlyStore {
     if (metrics.cumulativeOutputTokens == null) return;
     const total = Number(metrics.cumulativeOutputTokens);
     if (!Number.isFinite(total) || total < 0) return;
+
+    // Engine changed under this port (swap, restart, TTL reload): re-baseline
+    // silently. A fresh engine has generated ~nothing, so nothing is lost.
+    const engineId = metrics.engineId ?? null;
+    if (this._engine.get(key) !== engineId) {
+      this._engine.set(key, engineId);
+      this._last.set(key, total);
+      return;
+    }
 
     const prev = this._last.get(key);
     this._last.set(key, total);

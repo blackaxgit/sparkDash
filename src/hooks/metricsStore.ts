@@ -7,9 +7,13 @@ import type { SparkSnapshot } from "../api/types";
  * Fed once per WebSocket snapshot by useSnapshot. Components read time-series
  * via `useMetricsHistory` / `useMetricsHistoryTail` — a single source of truth that:
  *   - survives Spark tab switches (history is no longer per-panel useState),
- *   - caps each series at HISTORY_MAX samples (1 h at the default 2 s poll),
+ *   - caps each series at HISTORY_MAX samples,
  *   - lets future time-range charts read from one place,
  *   - keeps sparklines on a short tail (SPARKLINE_TAIL) so 84px charts stay readable.
+ *
+ * Seeded on connect by `hydrateHistory` from the server's ring buffer
+ * (server/collectors/MetricsHistory.js), so the charts open with real history
+ * instead of filling up from an empty tab at one sample per second.
  *
  * Also keeps the latest snapshot per spark (`getSpark` / `useSpark`) as the
  * selective-subscription seam (#8a).
@@ -19,13 +23,29 @@ import type { SparkSnapshot } from "../api/types";
  * actually changed. On each ingest we replace the history array with a new ref
  * (slice + append), so subscribers to that key re-render and all others skip.
  * All listeners are woken on notify; unchanged keys keep the same ref → no render.
+ *
+ * TIMING CONTRACT: `historyTimes` holds one timestamp per sample, index-aligned
+ * with the values and trimmed in lockstep, so `useSeriesStart` can report how
+ * much wall-clock time a chart actually spans. Sample count alone cannot: an
+ * offline host stops contributing samples while time keeps passing, so
+ * `length x pollInterval` would under-report the age of the leftmost point.
  */
 
-const HISTORY_MAX = 1800; // 1 h at 2 s poll — the WS interval, not wall-clock guarantees
-/** Samples shown in inline sparklines (≈1 min at 2 s poll). Full series stays in HISTORY_MAX. */
+/**
+ * Samples kept per series. 1 h at the 1 s floor on pollIntervalMs (the live
+ * setting), 2 h at 2 s. Must be >= the server's MAX_SAMPLES in
+ * server/collectors/MetricsHistory.js, otherwise hydration would be truncated
+ * on arrival and the tab would show less than the server actually has.
+ */
+const HISTORY_MAX = 3600;
+/** Samples shown in inline sparklines (≈30 s at the 1 s poll). Full series stays in HISTORY_MAX. */
 export const SPARKLINE_TAIL = 30;
+/** Cadence assumed only when the server sent no timing metadata for a series. */
+const FALLBACK_STEP_MS = 1000;
 
 const history = new Map<string, number[]>(); // key: `${sparkId}:${metric}`
+/** Sample timestamps, index-aligned with `history` — see TIMING CONTRACT. */
+const historyTimes = new Map<string, number[]>();
 /** Cached last-N views — refreshed whenever the full series is replaced. */
 const historyTails = new Map<string, readonly number[]>();
 const sparkMap = new Map<string, SparkSnapshot>();
@@ -53,20 +73,29 @@ function setHistoryTail(key: string, full: number[]) {
   historyTails.set(key, full.length <= SPARKLINE_TAIL ? full : full.slice(-SPARKLINE_TAIL));
 }
 
-function pushHistory(key: string, value: number) {
+function pushHistory(key: string, value: number, at: number) {
   const prev = history.get(key);
+  const prevTimes = historyTimes.get(key);
   // Build a fresh ref so useSyncExternalStore observes the change for this key.
   let next: number[];
+  let nextTimes: number[];
   if (!prev || prev.length === 0) {
     next = [value];
+    nextTimes = [at];
   } else if (prev.length >= HISTORY_MAX) {
-    next = prev.slice(prev.length - HISTORY_MAX + 1);
+    const from = prev.length - HISTORY_MAX + 1;
+    next = prev.slice(from);
     next.push(value);
+    nextTimes = (prevTimes ?? []).slice(from);
+    nextTimes.push(at);
   } else {
     next = prev.slice();
     next.push(value);
+    nextTimes = (prevTimes ?? []).slice();
+    nextTimes.push(at);
   }
   history.set(key, next);
+  historyTimes.set(key, nextTimes);
   setHistoryTail(key, next);
 }
 
@@ -75,14 +104,70 @@ function removeHistoryForSpark(sparkId: string) {
   for (const key of history.keys()) {
     if (key.startsWith(prefix)) {
       history.delete(key);
+      historyTimes.delete(key);
       historyTails.delete(key);
     }
   }
 }
 
+/**
+ * Rebuild per-sample timestamps for a hydrated series from the server's
+ * [first, last] pair. Both endpoints are real readings, so the age label — the
+ * only consumer — is exact; the interpolated interior is replaced by real
+ * timestamps as new samples arrive.
+ */
+function timesForHydrated(n: number, pair: readonly number[] | undefined): number[] {
+  const t0 = pair?.[0];
+  const tLast = pair?.[1];
+  if (typeof t0 !== "number" || typeof tLast !== "number" || !(tLast >= t0)) {
+    const end = Date.now();
+    return Array.from({ length: n }, (_, i) => end - (n - 1 - i) * FALLBACK_STEP_MS);
+  }
+  if (n === 1) return [tLast];
+  const step = (tLast - t0) / (n - 1);
+  return Array.from({ length: n }, (_, i) => Math.round(t0 + i * step));
+}
+
+/**
+ * Seed series from the server's ring buffer, sent once per WS connection.
+ *
+ * Keys are produced by the server key-for-key with `ingestSnapshots` below;
+ * anything unrecognized is simply never read.
+ *
+ * A shorter server series never replaces a longer local one. That matters on
+ * reconnect: the tab may already hold samples the server lost to a restart,
+ * and overwriting them would visibly shorten a chart that was full a second
+ * earlier. When the server has more, it is strictly the better source — it
+ * spans page loads and other tabs.
+ */
+export function hydrateHistory(
+  series: Record<string, number[]> | undefined,
+  meta?: Record<string, number[]>
+): void {
+  if (!series || typeof series !== "object") return;
+  let changed = false;
+
+  for (const [key, raw] of Object.entries(series)) {
+    if (!Array.isArray(raw)) continue;
+    const clean = raw.filter((v) => typeof v === "number" && Number.isFinite(v));
+    if (clean.length === 0) continue;
+    const existing = history.get(key);
+    if (existing && existing.length >= clean.length) continue;
+    const next = clean.length > HISTORY_MAX ? clean.slice(-HISTORY_MAX) : clean;
+    history.set(key, next);
+    historyTimes.set(key, timesForHydrated(next.length, meta?.[key]));
+    setHistoryTail(key, next);
+    changed = true;
+  }
+
+  if (changed) notify();
+}
+
 /** Ingest a full WS snapshot: update latest-per-spark + append history series. */
 export function ingestSnapshots(sparks: SparkSnapshot[]): void {
   const alive = new Set<string>();
+  // One timestamp for the whole frame, so every series on a panel agrees.
+  const at = Date.now();
 
   for (const s of sparks) {
     alive.add(s.id);
@@ -90,18 +175,18 @@ export function ingestSnapshots(sparks: SparkSnapshot[]): void {
     if (!s.online) continue; // don't record zero-samples for offline hosts
     const m = s.metrics;
     if (m.gpu) {
-      pushHistory(`${s.id}:gpu.usage`, m.gpu.usage);
-      pushHistory(`${s.id}:gpu.temp`, m.gpu.temperature);
+      pushHistory(`${s.id}:gpu.usage`, m.gpu.usage, at);
+      pushHistory(`${s.id}:gpu.temp`, m.gpu.temperature, at);
     }
     if (m.cpu) {
-      pushHistory(`${s.id}:cpu.usage`, m.cpu.usage);
+      pushHistory(`${s.id}:cpu.usage`, m.cpu.usage, at);
       // CPU temp is only shown for dedicated GPU hosts (not DGX Sparks).
       if (s.kind === "host" && m.cpu.temperature > 0) {
-        pushHistory(`${s.id}:cpu.temp`, m.cpu.temperature);
+        pushHistory(`${s.id}:cpu.temp`, m.cpu.temperature, at);
       }
     }
     if (m.ram) {
-      pushHistory(`${s.id}:ram.percentage`, m.ram.percentage);
+      pushHistory(`${s.id}:ram.percentage`, m.ram.percentage, at);
     }
     if (Array.isArray(m.llm)) {
       // Zip with snapshot.llmPorts so multi-port LLM series key distinctly.
@@ -110,18 +195,22 @@ export function ingestSnapshots(sparks: SparkSnapshot[]): void {
         const llm = m.llm[i];
         const port = ports[i];
         const portKey = port != null ? `:${port}` : `:${i}`;
-        pushHistory(`${s.id}:llm${portKey}.tps`, llm.generationTps);
-        pushHistory(`${s.id}:llm${portKey}.prefill`, llm.prefillTps);
+        pushHistory(`${s.id}:llm${portKey}.tps`, llm.generationTps, at);
+        pushHistory(`${s.id}:llm${portKey}.prefill`, llm.prefillTps, at);
         if (llm.cachedPrefillTps != null) {
-          pushHistory(`${s.id}:llm${portKey}.prefillCached`, llm.cachedPrefillTps);
+          pushHistory(`${s.id}:llm${portKey}.prefillCached`, llm.cachedPrefillTps, at);
         }
         if (llm.uncachedPrefillTps != null) {
-          pushHistory(`${s.id}:llm${portKey}.prefillUncached`, llm.uncachedPrefillTps);
+          pushHistory(`${s.id}:llm${portKey}.prefillUncached`, llm.uncachedPrefillTps, at);
         }
       }
     }
     if (m.comfy?.available) {
-      pushHistory(`${s.id}:comfy.queue`, (m.comfy.queueRunning ?? 0) + (m.comfy.queuePending ?? 0));
+      pushHistory(
+        `${s.id}:comfy.queue`,
+        (m.comfy.queueRunning ?? 0) + (m.comfy.queuePending ?? 0),
+        at
+      );
     }
   }
 
@@ -152,6 +241,11 @@ function getHistoryTail(key: string): readonly number[] {
   return historyTails.get(key) ?? EMPTY;
 }
 
+function getSeriesStartMs(key: string): number | undefined {
+  const t = historyTimes.get(key);
+  return t && t.length ? t[0] : undefined;
+}
+
 /**
  * Subscribe to one metric's full history series for one spark (up to HISTORY_MAX).
  * Re-renders only when that specific (sparkId, metric) array ref changes.
@@ -179,6 +273,22 @@ export function useMetricsHistoryTail(sparkId: string, metric: string): readonly
 }
 
 /**
+ * Timestamp of the leftmost drawn sample, or undefined when the series is
+ * empty. Deliberately returns the fixed start rather than an age: an age would
+ * be a new number on every getSnapshot call, which useSyncExternalStore treats
+ * as a changed store and re-renders forever. Callers subtract from Date.now()
+ * at render time — renders already happen once per snapshot.
+ */
+export function useSeriesStart(sparkId: string, metric: string): number | undefined {
+  const key = `${sparkId}:${metric}`;
+  return useSyncExternalStore(
+    subscribeMetrics,
+    () => getSeriesStartMs(key),
+    () => undefined
+  );
+}
+
+/**
  * Subscribe to one spark's latest snapshot. Re-renders when that spark's
  * cached object is replaced (every WS frame that includes it).
  */
@@ -193,6 +303,7 @@ export function useSpark(id: string): SparkSnapshot | undefined {
 /** Clear all cached state — used on hard reload paths / tests. */
 export function _resetStore(): void {
   history.clear();
+  historyTimes.clear();
   historyTails.clear();
   sparkMap.clear();
 }

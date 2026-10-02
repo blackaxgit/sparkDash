@@ -9,6 +9,21 @@ Format: version sections are listed newest first.
 
 ## [Unreleased]
 
+### Fixed
+- **llama-swap router ports showed the wrong model** — a llama-swap proxy fronts N engines on one OpenAI port, and its `/v1/models` is its *config* (every model and alias), so the LLM card read the first alias — on a Spark, `embeddings` with an 8,192 context — while its tiles came from a hardcoded `http://127.0.0.1:8000/metrics`. Identity and metrics were two different engines. The probe now detects `owned_by: llama-swap`, resolves the live engine from `GET /running`, and reads model id, context length (`max_model_len`), repo (`root`) and Prometheus metrics from that one engine.
+- **Engine swaps spiked tok/s and left stale tiles** — each swap starts a new process whose counters restart at zero. Engines are now identified by `model@process_start_time_seconds`; the first sample of a new engine seeds the baseline instead of becoming a rate, and KV / TTFT / ITL / MTP clear with the engine instead of persisting from the model that left.
+- **Hourly token volume double-counted a swap** — `config/llm-hourly.json` booked a freshly loaded engine's historical counter into the current hour. The series re-baselines per engine identity.
+- **vLLM Engine tile could never read Sleeping** — vLLM ≥ 0.11 exposes `vllm:engine_sleep_state` as one series per state (`awake` / `weights_offloaded` / `discard_all`), so the unlabeled sum was always 1. The probe reads the `awake` series when it is present.
+- **A remote Spark could scrape the dashboard host's own loopback** — the removed `http://127.0.0.1:8000/metrics` fallback ran against the dashboard, not the monitored unit. Upstream addresses now come from the router and have their loopback host rewritten to the probe host.
+- **Benchmark and Showcase targeted the alias** — both take the model id from the panel, which was `embeddings`; they now get the router key of the loaded model, and server-side tok/s during a run reads that engine's counters through the router.
+- **A ComfyUI studio was treated as an LLM engine** — llama-swap lists video studios (ComfyUI) in `/running` like any member. The LLM probe now detects them (`GET /system_stats` on the upstream origin, unauthenticated, cached) and keeps them out of engine selection, the resident list and loading detection; the card shows *GPU held by video studio … — chat models unloaded* instead.
+
+### Added
+- **Router state on the LLM card** — a `llama-swap` chip beside the backend badge, `loading <model>…` while an engine cold-starts (Spark cold starts run 3–10 min), and a **Resident** tile with the number of models holding memory, replacing a Slots tile that vLLM can never populate.
+- **Per-model tokens when several engines are resident** — a **Resident models** list on the router card, one row per model holding memory, each with its own live tok/s and its own generated-token counter measured from that engine's own start. The rest of the card describes the followed model, so without this a second busy engine looked idle. Exposed as `routerEngines[]` on the LLM metrics payload.
+- **Video panel** — for llama-swap Sparks that run ComfyUI studios: the resident studio, the job rendering now (client, diffusion / text-encoder / VAE / LoRA files, resolution × frames, steps, estimated progress and ETA from recent job durations), the queue, the last renders with durations and output files, a 24 h GPU-busy chart, and how many LLM requests are waiting behind the studio's GPU lease. Studio traffic goes to the upstream origin from `/running`, never through llama-swap's `/upstream/` path (which can load a model), with no redirects and capped response bodies. Exposed as `metrics.video`.
+- **Thermal warnings** — the GPU card shows T.Limit headroom, hottest thermal zone against its critical trip point, and HW / SW thermal-slowdown and power-cap time since boot (a separate, backed-off `nvidia-smi` query, so older drivers keep their GPU metrics). Warn at headroom ≤ 2 °C, a zone ≥ 98 °C or ≥ 6 s of SW thermal slowdown in the last 10 min (sub-second firmware blips under sustained load only highlight the counter); critical on any HW thermal slowdown in the last 10 min or a zone within 4 °C of critical. Shown as a banner on the GPU card and on the Overview card. Exposed as `gpu.thermal`.
+
 ---
 
 ## [1.8.5] — 2026-08-28

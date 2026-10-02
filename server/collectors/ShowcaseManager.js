@@ -658,6 +658,7 @@ export class ShowcaseManager {
       400,
       {
         apiKey: session._apiKey,
+        modelId: session.modelId || null,
         onSample: (info) => {
           if (session.status !== "running") return;
           session.serverGenerationTps = info.median;

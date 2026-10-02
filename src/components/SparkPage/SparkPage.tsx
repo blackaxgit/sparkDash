@@ -11,6 +11,7 @@ import { NetworkPanel } from "./NetworkPanel";
 import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
+import { VideoPanel } from "./VideoPanel";
 import { ChevronDownIcon, ColumnsIcon, RowsIcon } from "../ui/icons";
 
 interface SparkPageProps {
@@ -188,7 +189,8 @@ export function SparkPage({
   const llmOn = isLlmMonitoringEnabled(spark);
   const comfyOn = Boolean(spark.comfyMonitoring);
   const tailscaleOn = Boolean(spark.tailscaleMonitoring);
-  const showServices = llmOn || comfyOn;
+  const videoOn = Boolean(metrics.video?.available);
+  const showServices = llmOn || comfyOn || videoOn;
   const primaryPort = llmPorts[0];
   const extraPorts = llmPorts.slice(1);
 
@@ -197,11 +199,12 @@ export function SparkPage({
    * then ComfyUI. They pair up half-and-half; only a trailing odd card spans
    * both columns so it doesn't sit alone at half width.
    */
-  const serviceCardCount = (llmOn ? llmPorts.length : 0) + (comfyOn ? 1 : 0);
+  const serviceCardCount = (llmOn ? llmPorts.length : 0) + (comfyOn ? 1 : 0) + (videoOn ? 1 : 0);
   const spansFullWidth = (index: number) =>
     servicesLayout === "rows" ||
     (serviceCardCount % 2 === 1 && index === serviceCardCount - 1);
   const comfyCardIndex = llmOn ? llmPorts.length : 0;
+  const videoCardIndex = comfyCardIndex + (comfyOn ? 1 : 0);
 
   /** Both layouts look identical with a single card, so only offer the choice above one. */
   const servicesLayoutToggle =
@@ -243,6 +246,7 @@ export function SparkPage({
         hasApiKey={Boolean(spark.llmApiKeyPorts?.includes(port))}
         onRemovePort={canRemove ? handleRemovePort : undefined}
         className={className}
+        llmWait={metrics.video?.llmWait ?? null}
       />
     );
   };
@@ -363,6 +367,12 @@ export function SparkPage({
                   spansFullWidth(j + 1) ? "md:col-span-2" : undefined
                 )
               )}
+            {videoOn && metrics.video && (
+              <VideoPanel
+                video={metrics.video}
+                className={spansFullWidth(videoCardIndex) ? "md:col-span-2" : undefined}
+              />
+            )}
             {llmOn &&
               (showAddPort ? (
                 <div className="md:col-span-2 rounded-lg border border-border bg-surface p-3">

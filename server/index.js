@@ -20,6 +20,7 @@ import {
 import { showcaseManager } from "./collectors/ShowcaseManager.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
 import { llmHourly } from "./collectors/LlmHourly.js";
+import { metricsHistory, MAX_SAMPLES } from "./collectors/MetricsHistory.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 
 dotenv.config();
@@ -1291,6 +1292,23 @@ app.get("*splat", (_req, res) => {
 const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", (ws) => {
   console.log("[ws] client connected");
+  // Seed this client's sparkline history before its first snapshot, so the
+  // charts open with the last hour instead of building up from an empty tab.
+  // Sent to this socket only — the other clients already have their series.
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "history",
+        series: metricsHistory.getAll(),
+        // Sample timestamps, so the client can label the age of the leftmost
+        // point instead of inferring it from the sample count.
+        meta: metricsHistory.getMeta(),
+        max: MAX_SAMPLES,
+      })
+    );
+  } catch (err) {
+    console.error("[ws] history hydration failed:", err.message);
+  }
   // Send the initial snapshot through the same path the broadcast uses so the
   // new client benefits from the same payload format (and bufferedAmount
   // guard, although a freshly-open socket trivially passes it).
@@ -1352,6 +1370,10 @@ function forceBroadcast() {
 function startBroadcast() {
   const interval = getSettings().pollIntervalMs;
   broadcastTimer = setInterval(() => {
+    // Record before the skip below: history must advance at a steady cadence
+    // even on an idle box whose snapshot happens to serialize identically.
+    // Only the timer feeds history — forceBroadcast() must not double-sample.
+    metricsHistory.recordSnapshot(orderedSnapshots());
     const payload = buildSnapshotPayload();
     // Skip the broadcast entirely when nothing changed since the last tick.
     // A 1s poll that produces identical snapshots becomes free for idle tabs.
@@ -1408,6 +1430,11 @@ function shutdown(signal) {
     llmHourly.flush();
   } catch (err) {
     console.error("[sparkDash] failed to flush LLM daily history:", err.message);
+  }
+  try {
+    metricsHistory.flush();
+  } catch (err) {
+    console.error("[sparkDash] failed to flush metrics history:", err.message);
   }
   try {
     if (broadcastTimer) {

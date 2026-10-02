@@ -25,3 +25,4 @@ HANDOFF-HERMES.md
 handoff.md
 test/
 config/llm-hourly.json
+config/metrics-history.json

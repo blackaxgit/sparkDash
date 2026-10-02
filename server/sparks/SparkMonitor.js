@@ -3,6 +3,7 @@ import path from "path";
 import { SystemCollector } from "../collectors/SystemCollector.js";
 import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
+import { VideoStudioProbe } from "../collectors/VideoStudioProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
 import { llmHourly } from "../collectors/LlmHourly.js";
@@ -14,6 +15,7 @@ import {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
+  POLL_INTERVAL_VIDEO,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
   POLL_INTERVAL_HERMES,
@@ -52,6 +54,13 @@ export class SparkMonitor {
     /** @type {ComfyProbe | null} */
     this.comfyProbe = this._comfyMonitoringEnabled(spark)
       ? new ComfyProbe(spark, this._comfyPort(spark))
+      : null;
+
+    // Video studio (ComfyUI behind llama-swap): only for sparks with LLM monitoring on; the
+    // probe stays silent (null) until an LLM port is detected as a llama-swap router.
+    /** @type {VideoStudioProbe | null} */
+    this.videoProbe = this._llmMonitoringEnabled(spark)
+      ? new VideoStudioProbe(spark, { routerPorts: () => this._routerPorts() })
       : null;
 
     /** @type {TailscaleProbe | null} */
@@ -96,6 +105,7 @@ export class SparkMonitor {
       unifiedMemory: this.collector._defaultUnifiedMemory(),
       llm: [],
       comfy: null,
+      video: null,
       tailscale: null,
     };
     this._lastUpdate = {};
@@ -175,6 +185,19 @@ export class SparkMonitor {
       }
       this.comfyProbe = null;
       this._metrics.comfy = null;
+    }
+
+    // Video studio probe — create / update / clear with LLM monitoring
+    if (this._llmMonitoringEnabled()) {
+      if (this.videoProbe) {
+        this.videoProbe.setTarget(spark);
+      } else {
+        this.videoProbe = new VideoStudioProbe(spark, { routerPorts: () => this._routerPorts() });
+      }
+    } else {
+      if (this.videoProbe) this.videoProbe.dispose();
+      this.videoProbe = null;
+      this._metrics.video = null;
     }
 
     // Tailscale probe — create / update / clear
@@ -338,6 +361,15 @@ export class SparkMonitor {
     return [LLM_PORT];
   }
 
+  /** LLM ports whose probe has detected a llama-swap router. */
+  _routerPorts() {
+    const ports = [];
+    for (const probe of this.llmProbes.values()) {
+      if (probe.router === "llama-swap") ports.push(probe.port);
+    }
+    return ports;
+  }
+
   /** Start background polling. */
   start() {
     if (this._running) return;
@@ -351,6 +383,7 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("ram"), POLL_INTERVAL_CPU));
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
+    this._intervals.push(setInterval(() => this._pollDomain("video"), POLL_INTERVAL_VIDEO));
     this._restartComfyPollInterval();
     this._restartHermesPollInterval();
     this._restartTailscalePollInterval();
@@ -373,6 +406,13 @@ export class SparkMonitor {
     if (this.comfyProbe) {
       try {
         this.comfyProbe.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (this.videoProbe) {
+      try {
+        this.videoProbe.dispose();
       } catch {
         /* ignore */
       }
@@ -429,6 +469,7 @@ export class SparkMonitor {
         unifiedMemory: this._metrics.unifiedMemory,
         llm: this._metrics.llm,
         comfy: comfyOn ? this._metrics.comfy : null,
+        video: this._metrics.video ?? undefined,
         tailscale: tailscaleOn ? this._metrics.tailscale : null,
       },
     };
@@ -498,6 +539,7 @@ export class SparkMonitor {
       this._pollDomain("memory"),
       this._pollDomain("llm"),
       this._pollDomain("comfy"),
+      this._pollDomain("video"),
       this._pollDomain("hermes"),
       this._pollDomain("tailscale"),
     ]);
@@ -510,6 +552,7 @@ export class SparkMonitor {
     // Worker nodes: no local LLM API
     if (domain === "llm" && !this._llmMonitoringEnabled()) return;
     if (domain === "comfy" && !this._comfyMonitoringEnabled()) return;
+    if (domain === "video" && !this.videoProbe) return;
     if (domain === "hermes" && !this._hermesMonitoringEnabled()) return;
     if (domain === "tailscale" && !this._tailscaleMonitoringEnabled()) return;
     this._inflight[domain] = true;
@@ -542,6 +585,9 @@ export class SparkMonitor {
           break;
         case "comfy":
           result = this.comfyProbe ? await this.comfyProbe.probe() : null;
+          break;
+        case "video":
+          result = this.videoProbe ? await this.videoProbe.probe() : null;
           break;
         case "tailscale":
           result = this.tailscaleProbe ? await this.tailscaleProbe.probe() : null;
@@ -596,6 +642,9 @@ export class SparkMonitor {
           break;
         case "comfy":
           this._metrics.comfy = result;
+          break;
+        case "video":
+          this._metrics.video = result;
           break;
         case "tailscale":
           this._metrics.tailscale = result;

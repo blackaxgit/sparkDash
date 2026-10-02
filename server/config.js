@@ -32,6 +32,8 @@ const POLL_INTERVAL_NETWORK = parseInt(process.env.POLL_INTERVAL_NETWORK || "200
 const POLL_INTERVAL_STORAGE = parseInt(process.env.POLL_INTERVAL_STORAGE || "5000", 10);
 const POLL_INTERVAL_LLM = parseInt(process.env.POLL_INTERVAL_LLM || "2000", 10);
 const POLL_INTERVAL_COMFY = parseInt(process.env.POLL_INTERVAL_COMFY || "2000", 10);
+// Video studio (ComfyUI behind llama-swap) queue/progress; local HTTP only, no SSH.
+const POLL_INTERVAL_VIDEO = parseInt(process.env.POLL_INTERVAL_VIDEO || "3000", 10);
 // Tailnet membership changes slowly; each poll is an SSH round-trip.
 const POLL_INTERVAL_TAILSCALE = parseInt(process.env.POLL_INTERVAL_TAILSCALE || "30000", 10);
 // dmon -c 1 -d 1 blocks ~1s; default 2s avoids stacking with in-flight guards
@@ -105,6 +107,7 @@ export {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
+  POLL_INTERVAL_VIDEO,
   POLL_INTERVAL_TAILSCALE,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,

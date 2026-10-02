@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { SparkSnapshot, WsSnapshot } from "../api/types";
-import { ingestSnapshots } from "./metricsStore";
+import type { SparkSnapshot, WsMessage } from "../api/types";
+import { hydrateHistory, ingestSnapshots } from "./metricsStore";
 import { OVERVIEW_ID } from "../constants";
 
 const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
@@ -37,7 +37,14 @@ export function useSnapshot() {
 
     ws.onmessage = (ev) => {
       try {
-        const msg: WsSnapshot = JSON.parse(ev.data);
+        const msg: WsMessage = JSON.parse(ev.data);
+        if (msg.type === "history") {
+          // Sent once per connection, ahead of the first snapshot: the server's
+          // ring buffer, so the sparklines open with real history rather than
+          // filling from empty at one sample per second.
+          hydrateHistory(msg.series, msg.meta);
+          return;
+        }
         if (msg.type === "snapshot") {
           // Feed the central history store (8b) before notifying React state.
           ingestSnapshots(msg.sparks);
