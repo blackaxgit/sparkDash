@@ -3,8 +3,9 @@
  * GPU/LLM collectors cannot see: kernel pressure (PSI), swap, NVMe SMART,
  * PCIe AER, GPU Xid, failed systemd units, container state and Wi-Fi link.
  *
- * Every section is independent: a missing tool (smartctl, docker, iw, ...)
- * yields null / empty for that section only, never a failed probe.
+ * Every section is independent: a missing or hung tool (smartctl, docker, iw, ...;
+ * the slow ones run under `timeout 5`) yields null / empty for that section only,
+ * never a failed probe.
  */
 import { HOST_PATHS } from "../config.js";
 import { sshExec } from "./ssh.js";
@@ -27,12 +28,12 @@ export const HOST_HEALTH_SCRIPT = [
   "echo '---psiio'; cat /proc/pressure/io 2>/dev/null || true",
   "echo '---load'; cat /proc/loadavg 2>/dev/null || true",
   "echo '---swap'; grep -E '^Swap(Total|Free):' /proc/meminfo 2>/dev/null || true",
-  "echo '---nvme'; smartctl -j -a /dev/nvme0 2>/dev/null || true",
+  "echo '---nvme'; timeout 5 smartctl -j -a /dev/nvme0 2>/dev/null || true",
   "echo '---aer'; ls /sys/bus/pci/devices/*/aer_dev_fatal >/dev/null 2>&1 && awk '/^TOTAL_ERR_COR/{c+=$2} /^TOTAL_ERR_NONFATAL/{n+=$2} /^TOTAL_ERR_FATAL/{f+=$2} END{print \"cor=\" c+0, \"nonfatal=\" n+0, \"fatal=\" f+0}' /sys/bus/pci/devices/*/aer_dev_correctable /sys/bus/pci/devices/*/aer_dev_nonfatal /sys/bus/pci/devices/*/aer_dev_fatal 2>/dev/null || true",
-  `echo '---xid'; { journalctl -k --since -24h -q --no-pager 2>/dev/null && echo '${JOURNAL_OK}'; } | grep -E 'NVRM: Xid|^${JOURNAL_OK}$' || true`,
-  "echo '---units'; systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' || true",
-  "echo '---containers'; docker ps -a --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null || true",
-  'echo \'---wifi\'; for p in /sys/class/net/*; do if [ -d "$p/wireless" ]; then n=${p##*/}; echo "IF $n"; iw dev "$n" link 2>/dev/null; fi; done; true',
+  `echo '---xid'; { timeout 5 journalctl -k --since -24h -q --no-pager 2>/dev/null && echo '${JOURNAL_OK}'; } | grep -E 'NVRM: Xid|^${JOURNAL_OK}$' || true`,
+  "echo '---units'; timeout 5 systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' || true",
+  "echo '---containers'; timeout 5 docker ps -a --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null || true",
+  'echo \'---wifi\'; for p in /sys/class/net/*; do if [ -d "$p/wireless" ]; then n=${p##*/}; echo "IF $n"; timeout 5 iw dev "$n" link 2>/dev/null; fi; done; true',
 ].join("; ");
 
 /**

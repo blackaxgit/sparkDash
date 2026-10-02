@@ -65,7 +65,8 @@ function trimLong(entry, now) {
 /** Per-minute figures worth charting over days, keyed without the spark prefix. */
 function longSamples(m, llmPorts) {
   const out = {};
-  if (m.gpu) {
+  // A failed GPU collection reports zeros; leave the keys out so the minute is a gap.
+  if (m.gpu && m.gpu.collected !== false) {
     out["gpu.usage"] = m.gpu.usage;
     out["gpu.temp"] = m.gpu.temperature;
     out["gpu.power"] = m.gpu.power?.draw;
@@ -168,8 +169,17 @@ export class MetricsHistoryStore {
         trimLong(entry, now);
         if (entry.values.some((v) => v !== null)) this._long.set(key, entry);
       }
-    } catch {
+    } catch (err) {
       this._long.clear();
+      const corrupt = `${this.longFilePath}.corrupt-${Date.now()}`;
+      console.warn(
+        `[MetricsHistory] unreadable long-tier file ${this.longFilePath}: ${err.message}; moving to ${corrupt}`
+      );
+      try {
+        fs.renameSync(this.longFilePath, corrupt);
+      } catch (renameErr) {
+        console.warn("[MetricsHistory] could not move corrupt long-tier file:", renameErr.message);
+      }
     }
   }
 
@@ -309,8 +319,8 @@ export class MetricsHistoryStore {
     this._flushTimer.unref?.();
   }
 
+  /** Short tier only; the long tier has its own, slower cadence (see flushLong). */
   flush() {
-    this.flushLong();
     if (!this._dirty) return;
     try {
       const times = {};
@@ -329,6 +339,12 @@ export class MetricsHistoryStore {
     } catch (err) {
       console.error("[MetricsHistory] write failed:", err.message);
     }
+  }
+
+  /** Both tiers; for shutdown, where the long tier's cadence no longer applies. */
+  flushAll() {
+    this.flush();
+    this.flushLong();
   }
 
   /**
@@ -433,6 +449,7 @@ export class MetricsHistoryStore {
         if (id && !alive.has(id)) {
           map.delete(key);
           this._longDirty = true;
+          this._scheduleLongFlush();
         }
       }
     }

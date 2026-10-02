@@ -459,6 +459,8 @@ export interface LlmRouterActivity {
   lastHour: LlmRouterRequestCounts;
   /** Newest first, at most 5. */
   recentErrors: { at: number; model: string; status: number; message: string | null; src: string | null }[];
+  /** True when the activity page was full (999 rows): the hourly chart covers fewer than 24 h. */
+  truncated: boolean;
   updatedAt: number;
 }
 
@@ -527,7 +529,7 @@ export interface LlmMetrics {
    * Each engine counts its own tokens from its own start.
    */
   routerEngines?: LlmRouterEngine[];
-  /** Model state changes behind the router, newest first, at most 30. In memory only. */
+  /** Model state changes behind the router, newest first, at most 10. In memory only. */
   routerEvents?: LlmRouterEvent[];
   /** Request outcomes over the last 24 h; null until the first activity read succeeds. */
   routerActivity?: LlmRouterActivity | null;

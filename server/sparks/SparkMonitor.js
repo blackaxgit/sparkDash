@@ -105,9 +105,9 @@ export class SparkMonitor {
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
     this.lastOnlineOk = 0;
-    // Set once a liveness check has run for the current run; until then `online` is just
-    // its initial value and domains must still poll.
-    this._onlineChecked = false;
+    // True only while the latest liveness check has failed for the current run. While it is
+    // false (before the first check, or after a success) domains must still poll.
+    this._offlineConfirmed = false;
 
     // System uptime seconds (from /proc/uptime), null when offline
     this._uptimeSeconds = null;
@@ -171,7 +171,7 @@ export class SparkMonitor {
     this._runGeneration += 1;
     this._inflight = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
-    this._onlineChecked = false;
+    this._offlineConfirmed = false;
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -446,6 +446,7 @@ export class SparkMonitor {
     if (this._running) return;
     this._runGeneration += 1;
     this._running = true;
+    this._offlineConfirmed = false;
     this._stopped = false;
     this._poll();
     this._intervals.push(setInterval(() => this._pollDomain("gpu"), POLL_INTERVAL_GPU));
@@ -604,6 +605,7 @@ export class SparkMonitor {
       if (!isCurrentRun()) return;
       this.online = true;
       this.lastOnlineOk = Date.now();
+      this._offlineConfirmed = false;
       this._uptimeSeconds = uptimeSeconds;
     } catch {
       if (!isCurrentRun()) return;
@@ -611,7 +613,7 @@ export class SparkMonitor {
         this.online = false;
         this._uptimeSeconds = null;
       }
-      this._onlineChecked = true;
+      this._offlineConfirmed = true;
     } finally {
       if (this._inflight.online === checkToken) {
         this._inflight.online = false;
@@ -643,7 +645,7 @@ export class SparkMonitor {
     if (!this._running || this._inflight[domain]) return;
     // Offline hosts: skip every domain (liveness keeps running via _checkOnline, which
     // flips `online` back and so resumes polling on the next tick).
-    if (this._onlineChecked && this.online === false) return;
+    if (this._offlineConfirmed && this.online === false) return;
     // Skip storage auto-poll when disabled for this spark
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API

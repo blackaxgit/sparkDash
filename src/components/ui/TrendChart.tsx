@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 export interface TrendSeries {
   /** [timestampMs, value | null] oldest first; null breaks the line. */
@@ -74,24 +74,63 @@ export function TrendChart({
     return () => ro.disconnect();
   }, []);
 
-  const values: number[] = [];
-  let t0 = Infinity;
-  let t1 = -Infinity;
-  for (const s of series) {
-    for (const [t, v] of s.points) {
-      if (t < t0) t0 = t;
-      if (t > t1) t1 = t;
-      if (v !== null) values.push(v);
+  const plot = useMemo(() => {
+    const values: number[] = [];
+    let t0 = Infinity;
+    let t1 = -Infinity;
+    for (const s of series) {
+      for (const [t, v] of s.points) {
+        if (t < t0) t0 = t;
+        if (t > t1) t1 = t;
+        if (v !== null) values.push(v);
+      }
     }
-  }
+    if (values.length === 0) return null;
 
-  const fmt = (v: number) => `${format(v)}${unit}`;
+    const fmt = (v: number) => `${format(v)}${unit}`;
+    const lo = min ?? Math.min(...values);
+    let hi = max ?? Math.max(...values);
+    if (hi <= lo) hi = lo + 1;
 
-  if (values.length === 0) {
+    const plotW = Math.max(1, width - GUTTER - PAD_R);
+    const span = Math.max(1, t1 - t0);
+    const x = (t: number) => GUTTER + ((t - t0) / span) * plotW;
+    const y = (v: number) => height - ((Math.min(Math.max(v, lo), hi) - lo) / (hi - lo)) * height;
+
+    const paths = series.map((s) => {
+      let d = "";
+      let run: [number, number][] = [];
+      const flushRun = () => {
+        if (run.length === 1) d += `M${run[0][0].toFixed(1)},${run[0][1].toFixed(1)}h0.1`;
+        else if (run.length > 1) {
+          d += "M" + run.map(([px, py]) => `${px.toFixed(1)},${py.toFixed(1)}`).join("L");
+        }
+        run = [];
+      };
+      for (const [t, v] of s.points) {
+        if (v === null) flushRun();
+        else run.push([x(t), y(v)]);
+      }
+      flushRun();
+      return d;
+    });
+
+    const summary = series
+      .map((s) => {
+        const last = [...s.points].reverse().find(([, v]) => v !== null);
+        return `${s.label} ${last ? fmt(last[1] as number) : "no data"}`;
+      })
+      .join(", ");
+
+    return { t0, t1, lo, hi, plotW, span, withDay: span > DAY_MS, paths, summary, x, fmt };
+    // `format`/`unit` feed the labels; callers pass stable values (or primitives).
+  }, [series, width, height, min, max, unit, format]);
+
+  if (!plot) {
     return (
       <div
         ref={wrapRef}
-        className="flex w-full items-center justify-center text-xs text-muted"
+        className="flex w-full min-w-0 items-center justify-center text-xs text-muted"
         style={{ height: height + AXIS_H }}
         role="img"
         aria-label="No data yet"
@@ -100,41 +139,7 @@ export function TrendChart({
       </div>
     );
   }
-
-  const lo = min ?? Math.min(...values);
-  let hi = max ?? Math.max(...values);
-  if (hi <= lo) hi = lo + 1;
-
-  const plotW = Math.max(1, width - GUTTER - PAD_R);
-  const span = Math.max(1, t1 - t0);
-  const x = (t: number) => GUTTER + ((t - t0) / span) * plotW;
-  const y = (v: number) => height - ((Math.min(Math.max(v, lo), hi) - lo) / (hi - lo)) * height;
-
-  const withDay = span > DAY_MS;
-  const paths = series.map((s) => {
-    let d = "";
-    let run: [number, number][] = [];
-    const flushRun = () => {
-      if (run.length === 1) d += `M${run[0][0].toFixed(1)},${run[0][1].toFixed(1)}h0.1`;
-      else if (run.length > 1) {
-        d += "M" + run.map(([px, py]) => `${px.toFixed(1)},${py.toFixed(1)}`).join("L");
-      }
-      run = [];
-    };
-    for (const [t, v] of s.points) {
-      if (v === null) flushRun();
-      else run.push([x(t), y(v)]);
-    }
-    flushRun();
-    return d;
-  });
-
-  const summary = series
-    .map((s) => {
-      const last = [...s.points].reverse().find(([, v]) => v !== null);
-      return `${s.label} ${last ? fmt(last[1] as number) : "no data"}`;
-    })
-    .join(", ");
+  const { t0, t1, hi, lo, plotW, span, withDay, paths, summary, x, fmt } = plot;
 
   const ref = series.reduce((a, b) => (b.points.length > a.points.length ? b : a), series[0]);
   const hoverT = hoverTs === null ? null : ref.points[nearestIndex(ref.points, hoverTs)][0];
@@ -148,7 +153,7 @@ export function TrendChart({
   };
 
   return (
-    <div ref={wrapRef} className="relative w-full">
+    <div ref={wrapRef} className="relative w-full min-w-0">
       <svg
         width={width}
         height={height + AXIS_H}

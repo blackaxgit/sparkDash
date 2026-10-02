@@ -29,6 +29,11 @@ function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
 }
 
+/** Tooltip formatter for °C-valued history, shown in the user's unit. */
+function tempFormatter(unit: "celsius" | "fahrenheit"): (c: number) => string {
+  return (c) => (unit === "fahrenheit" ? `${celsiusToFahrenheit(c)}°F` : `${Number(c.toFixed(1))}°C`);
+}
+
 
 
 /** Format a storage value in MB, stripping trailing ".0" and optionally omitting the unit. */
@@ -343,8 +348,8 @@ function SparkCard({
                   data={gpuTempHistory}
                   height={16}
                   stretch
-                  unit="°C"
-                  ariaLabel="GPU temperature history (°C)"
+                  format={tempFormatter(temperatureUnit)}
+                  ariaLabel={`GPU temperature history (°${temperatureUnit === "fahrenheit" ? "F" : "C"})`}
                 />
               </div>
             </div>

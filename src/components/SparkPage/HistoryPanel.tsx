@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { fetchHistory } from "../../api/client";
 import type { HistoryRange, HistoryResponse } from "../../api/types";
 import { formatBytesPerSec } from "../../shared/formatBytes";
@@ -6,7 +6,13 @@ import { Panel } from "../ui/Panel";
 import { TrendChart, type TrendSeries } from "../ui/TrendChart";
 
 const RANGES: HistoryRange[] = ["1h", "24h", "7d"];
-const REFRESH_MS = 60_000;
+/** Refetch cadence per range: max(60 s, server step) — a new point cannot appear faster than the step. */
+const REFRESH_MS: Record<HistoryRange, number> = { "1h": 60_000, "24h": 60_000, "7d": 600_000 };
+
+// Module-level so the chart's memoization isn't defeated by a fresh closure per render.
+const formatNet = (v: number) => formatBytesPerSec(Math.round(v));
+/** The plotted temperature is °C; labels are shown in °F. */
+const formatFahrenheit = (c: number) => String(Math.round((c * 9) / 5 + 32));
 const LLM_COLORS = [
   "var(--color-accent)",
   "var(--color-success)",
@@ -40,7 +46,15 @@ function ChartBlock({
 }
 
 /** Long-term (1h / 24h / 7d) trend charts for one Spark, fed by GET /api/sparks/:id/history. */
-export function HistoryPanel({ sparkId, llmPorts }: { sparkId: string; llmPorts: number[] }) {
+export function HistoryPanel({
+  sparkId,
+  llmPorts,
+  temperatureUnit = "celsius",
+}: {
+  sparkId: string;
+  llmPorts: number[];
+  temperatureUnit?: "celsius" | "fahrenheit";
+}) {
   const [range, setRange] = useState<HistoryRange>("24h");
   const [data, setData] = useState<HistoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -60,24 +74,48 @@ export function HistoryPanel({ sparkId, llmPorts }: { sparkId: string; llmPorts:
         });
     };
     load();
-    const t = setInterval(load, REFRESH_MS);
+    const t = setInterval(() => {
+      if (!document.hidden) load();
+    }, REFRESH_MS[range]);
+    const onVisibility = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [sparkId, range]);
 
-  const pts = (key: string) => data?.series[key] ?? [];
-  const one = (key: string, color: string, label: string): TrendSeries[] => [
-    { points: pts(key), color, label },
-  ];
-  const llmSeries: TrendSeries[] = llmPorts
-    .filter((port) => data?.series[`llm:${port}.tps`])
-    .map((port, i) => ({
-      points: pts(`llm:${port}.tps`),
-      color: LLM_COLORS[i % LLM_COLORS.length],
-      label: `:${port}`,
-    }));
+  // TrendChart memoizes on series identity, and this panel re-renders on every
+  // parent tick, so the series must only change when the fetched data does.
+  const portsKey = llmPorts.join(",");
+  const charts = useMemo(() => {
+    const pts = (key: string) => data?.series[key] ?? [];
+    const one = (key: string, color: string, label: string): TrendSeries[] => [
+      { points: pts(key), color, label },
+    ];
+    const ports = portsKey ? portsKey.split(",").map(Number) : [];
+    return {
+      usage: one("gpu.usage", "var(--color-accent)", "GPU"),
+      temp: one("gpu.temp", "var(--color-warning)", "Temp"),
+      power: one("gpu.power", "var(--color-success)", "Power"),
+      mem: one("mem.percentage", "var(--color-accent)", "Memory"),
+      cpu: one("cpu.usage", "var(--color-accent)", "CPU"),
+      net: [
+        { points: pts("net.rx"), color: "var(--color-success)", label: "rx" },
+        { points: pts("net.tx"), color: "var(--color-accent)", label: "tx" },
+      ] as TrendSeries[],
+      llm: ports
+        .filter((port) => data?.series[`llm:${port}.tps`])
+        .map((port, i) => ({
+          points: pts(`llm:${port}.tps`),
+          color: LLM_COLORS[i % LLM_COLORS.length],
+          label: `:${port}`,
+        })) as TrendSeries[],
+    };
+  }, [data, portsKey]);
 
   const tabs = (
     <div className="flex items-center gap-1" role="tablist" aria-label="History range">
@@ -106,47 +144,23 @@ export function HistoryPanel({ sparkId, llmPorts }: { sparkId: string; llmPorts:
       <div className="grid gap-4 md:grid-cols-2">
         <ChartBlock
           title="GPU usage"
-          series={one("gpu.usage", "var(--color-accent)", "GPU")}
+          series={charts.usage}
           unit="%"
           min={0}
           max={100}
         />
         <ChartBlock
           title="GPU temp"
-          series={one("gpu.temp", "var(--color-warning)", "Temp")}
-          unit="°C"
+          series={charts.temp}
+          unit={temperatureUnit === "fahrenheit" ? "°F" : "°C"}
+          format={temperatureUnit === "fahrenheit" ? formatFahrenheit : undefined}
         />
-        <ChartBlock
-          title="GPU power"
-          series={one("gpu.power", "var(--color-success)", "Power")}
-          unit="W"
-          min={0}
-        />
-        <ChartBlock
-          title="Memory"
-          series={one("mem.percentage", "var(--color-accent)", "Memory")}
-          unit="%"
-          min={0}
-          max={100}
-        />
-        <ChartBlock
-          title="CPU"
-          series={one("cpu.usage", "var(--color-accent)", "CPU")}
-          unit="%"
-          min={0}
-          max={100}
-        />
-        <ChartBlock
-          title="Network"
-          series={[
-            { points: pts("net.rx"), color: "var(--color-success)", label: "rx" },
-            { points: pts("net.tx"), color: "var(--color-accent)", label: "tx" },
-          ]}
-          format={(v) => formatBytesPerSec(Math.round(v))}
-          min={0}
-        />
+        <ChartBlock title="GPU power" series={charts.power} unit="W" min={0} />
+        <ChartBlock title="Memory" series={charts.mem} unit="%" min={0} max={100} />
+        <ChartBlock title="CPU" series={charts.cpu} unit="%" min={0} max={100} />
+        <ChartBlock title="Network" series={charts.net} format={formatNet} min={0} />
         {llmPorts.length > 0 && (
-          <ChartBlock title="LLM tok/s" series={llmSeries} unit=" tok/s" min={0} />
+          <ChartBlock title="LLM tok/s" series={charts.llm} unit=" tok/s" min={0} />
         )}
       </div>
     </Panel>

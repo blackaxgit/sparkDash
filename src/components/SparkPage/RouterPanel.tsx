@@ -145,6 +145,11 @@ export function RouterPanel({
               })}
             </div>
           )}
+          {hourly.length > 0 && (
+            <div className="text-[10px] text-muted">
+              {activity?.truncated ? "last 999 requests" : "last 24 h"}
+            </div>
+          )}
           {activity && activity.recentErrors.length > 0 && (
             <div className="space-y-0.5 pt-1">
               {activity.recentErrors.slice(0, 5).map((e, i) => (

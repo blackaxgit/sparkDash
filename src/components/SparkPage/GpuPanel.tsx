@@ -17,6 +17,11 @@ function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
 }
 
+/** Tooltip formatter for °C-valued history, shown in the user's unit. */
+function tempFormatter(unit: "celsius" | "fahrenheit"): (c: number) => string {
+  return (c) => (unit === "fahrenheit" ? `${celsiusToFahrenheit(c)}°F` : `${Number(c.toFixed(1))}°C`);
+}
+
 /** "NVIDIA GeForce RTX 5080" → "RTX 5080" for the per-card rows. */
 function shortGpuName(name: string | null): string {
   if (!name) return "";
@@ -121,7 +126,13 @@ function GpuDeviceRow({
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="text-muted">Temperature</span>
         <div className="flex items-center gap-2">
-          <Sparkline data={tempHistory} color={tempColor} width={84} height={16} unit="°C" />
+          <Sparkline
+            data={tempHistory}
+            color={tempColor}
+            width={84}
+            height={16}
+            format={tempFormatter(temperatureUnit)}
+          />
           <span className="font-tabular" style={{ color: tempColor }}>{tempLabel}</span>
         </div>
       </div>
@@ -233,7 +244,14 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
       <MetricRow
         label="Temperature"
         color={tempColor}
-        spark={<Sparkline data={tempHistory} color={tempColor} width={180} unit="°C" />}
+        spark={
+          <Sparkline
+            data={tempHistory}
+            color={tempColor}
+            width={180}
+            format={tempFormatter(temperatureUnit)}
+          />
+        }
         value={<span className="text-text-strong">{unavailable ? "—" : tempLabel}</span>}
       />
       {thermal && thermal.level !== "unknown" && (

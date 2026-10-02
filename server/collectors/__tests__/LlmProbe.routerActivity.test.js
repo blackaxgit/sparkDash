@@ -78,13 +78,13 @@ test("events: a model first seen ready, or a seeded loader that turns ready, has
   assert.equal(byModel.new.loadMs, null);
 });
 
-test("events: studio rows are tracked and the log is capped at 30, newest first", () => {
+test("events: studio rows are tracked and the log is capped at 10, newest first", () => {
   let s = diffRouterRows(null, [], 0, []);
   for (let i = 1; i <= 25; i++) {
     const present = i % 2 === 1;
     s = diffRouterRows(s.state, present ? [row("h3-studio"), row("llm")] : [], i * 1000, s.events);
   }
-  assert.equal(s.events.length, 30);
+  assert.equal(s.events.length, 10);
   assert.equal(s.events[0].at, 25_000, "newest first");
   assert.ok(s.events.some((e) => e.model === "h3-studio"));
 });
@@ -174,6 +174,14 @@ test("activity: recentErrors keeps the newest five; a non-activity payload is nu
   assert.equal(buildRouterActivity({ nope: 1 }, now), null);
 });
 
+test("activity: a full page is flagged truncated; a short page is not", () => {
+  const now = Date.now();
+  const rec = (i) => ({ timestamp: new Date(now - i * 1000).toISOString(), model: "m", resp_status_code: 200 });
+  const page = (n) => ({ data: Array.from({ length: n }, (_, i) => rec(i + 1)) });
+  assert.equal(buildRouterActivity(page(998), now).truncated, false);
+  assert.equal(buildRouterActivity(page(999), now).truncated, true);
+});
+
 // ─── models ─────────────────────────────────────────────
 
 test("models: aliases and foreign owners are dropped; sorted by id; loaded from status", () => {
@@ -190,6 +198,14 @@ test("models: aliases and foreign owners are dropped; sorted by id; loaded from 
     { id: "zeta", name: "Zeta", loaded: true },
   ]);
   assert.equal(parseRouterModels({}), null);
+});
+
+test("models: ids that are dot segments are dropped (they would escape the URL path)", () => {
+  const m = (id) => ({ id, owned_by: "llama-swap", meta: { llamaswap: { type: "model" } } });
+  assert.deepEqual(
+    parseRouterModels({ data: [m("."), m(".."), m("..."), m("ok")] }).map((x) => x.id),
+    ["...", "ok"]
+  );
 });
 
 function pollingFetch(state) {
@@ -218,6 +234,9 @@ function pollingFetch(state) {
 
 const EMBEDDER = { model: "qwen3-embedding", state: "ready", proxy: "http://127.0.0.1:8001" };
 
+/** Wait for the background router feeds (activity, models) started by the last probe(). */
+const settle = () => new Promise((r) => setImmediate(r));
+
 test("probe: activity and models land in the snapshot, read at most once a minute", async () => {
   const probe = new LlmProbe({ isLocal: true }, 11434);
   const state = {
@@ -229,9 +248,12 @@ test("probe: activity and models land in the snapshot, read at most once a minut
   const { fetch, calls } = pollingFetch(state);
   probe._fetch = fetch;
 
+  await probe.probe();
+  await settle();
   const snap = await probe.probe();
   assert.deepEqual(snap.routerModels, [{ id: "ornith-35b", name: "Ornith", loaded: true }]);
   assert.equal(snap.routerActivity.lastHour.rejected, 1);
+  assert.equal(snap.routerActivity.truncated, false);
 
   const activityCalls = () => calls.filter((c) => c.url.includes("/api/metrics/activity"));
   assert.equal(activityCalls().length, 1);
@@ -241,28 +263,114 @@ test("probe: activity and models land in the snapshot, read at most once a minut
   assert.ok(Math.abs(Date.now() - 24 * HOUR - start) < 5000, "start is now − 24 h (RFC 3339)");
 
   await probe.probe();
+  await settle();
   assert.equal(activityCalls().length, 1, "gated to one read per minute");
+});
+
+test("probe: the router poll does not wait for a slow activity or models read", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  const calls = [];
+  let polling = false;
+  probe._fetch = (url) => {
+    const u = String(url);
+    calls.push(u);
+    // Backend detection reads /v1/models before the first /running; the router feed's read never answers.
+    if (u.endsWith("/running")) polling = true;
+    if (u.endsWith(":11434/v1/models") && !polling) {
+      return Promise.resolve(jsonRes({ data: [{ id: "x", owned_by: "llama-swap" }] }));
+    }
+    if (u.includes("/api/metrics/activity") || u.endsWith(":11434/v1/models")) return new Promise(() => {}); // never resolves
+    if (u.endsWith("/slots")) return Promise.resolve(jsonRes({}, 404));
+    if (u.endsWith("/running")) return Promise.resolve(jsonRes({ running: [EMBEDDER] }));
+    if (u.endsWith(":8001/metrics")) return Promise.resolve(textRes(vllmMetrics({ start: 1 })));
+    return Promise.resolve(jsonRes({}, 404));
+  };
+  const timeout = new Promise((r) => setTimeout(() => r("hung"), 3000).unref());
+  const snap = await Promise.race([probe.probe(), timeout]);
+  assert.notEqual(snap, "hung", "probe() must resolve while the feeds are still pending");
+  assert.equal(snap.routerEngines[0].model, "qwen3-embedding");
+  assert.equal(snap.routerActivity, null);
+
+  const activityRun = probe._activityRun;
+  const modelsRun = probe._modelsRun;
+  assert.ok(activityRun && modelsRun, "both feeds are running in the background");
+  const before = calls.length;
+  probe._activityNextAt = 0;
+  probe._modelsNextAt = 0;
+  await Promise.race([probe.probe(), timeout]);
+  assert.equal(
+    calls.slice(before).filter((u) => u.includes("/api/metrics/activity")).length,
+    0,
+    "a feed still in flight is not started a second time"
+  );
+  assert.equal(probe._activityRun, activityRun);
+  assert.equal(probe._modelsRun, modelsRun);
 });
 
 test("probe: a failing activity read keeps the previous value; a 404 stays null and backs off", async () => {
   const probe = new LlmProbe({ isLocal: true }, 11434);
   const state = { running: [EMBEDDER], prompt: 0, activity: () => jsonRes({ data: [] }) };
-  const { fetch, calls } = pollingFetch(state);
+  const { fetch } = pollingFetch(state);
   probe._fetch = fetch;
   await probe.probe();
+  await settle();
   const first = probe.routerActivity;
   assert.ok(first);
 
-  state.activity = () => jsonRes({}, 500);
-  probe._activityNextAt = 0;
-  assert.equal((await probe.probe()).routerActivity, first, "previous value survives a failed read");
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    state.activity = () => jsonRes({}, 500);
+    probe._activityNextAt = 0;
+    await probe.probe();
+    await settle();
+    assert.equal(probe.routerActivity, first, "previous value survives a failed read");
+  } finally {
+    console.warn = warn;
+  }
 
   const old = new LlmProbe({ isLocal: true }, 11434);
   const oldState = { running: [EMBEDDER], prompt: 0, activity: () => jsonRes({}, 404) };
   const oldFetch = pollingFetch(oldState);
   old._fetch = oldFetch.fetch;
-  assert.equal((await old.probe()).routerActivity, null);
+  await old.probe();
+  await settle();
+  assert.equal(old.routerActivity, null);
   assert.ok(old._activityNextAt - Date.now() > 5 * MIN, "older llama-swap is not asked every minute");
+});
+
+test("probe: a failing feed backs off 1, 2, 4… minutes (cap 10) and logs once per state change", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  const state = { running: [EMBEDDER], prompt: 0, activity: () => jsonRes({}, 500) };
+  probe._fetch = pollingFetch(state).fetch;
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (...a) => warned.push(a.join(" "));
+  try {
+    const waits = [];
+    for (let i = 0; i < 6; i++) {
+      probe._activityNextAt = 0;
+      const before = Date.now();
+      await probe.probe();
+      await settle();
+      waits.push(Math.round((probe._activityNextAt - before) / MIN));
+    }
+    assert.deepEqual(waits, [1, 2, 4, 8, 10, 10]);
+    const failures = warned.filter((l) => l.includes("activity") && l.includes("failing"));
+    assert.equal(failures.length, 1, "one line for the whole failing run");
+    assert.ok(failures[0].includes("HTTP 500") && failures[0].includes("/api/metrics/activity"));
+    assert.ok(!failures[0].includes("start="), "no query string in the log");
+
+    state.activity = () => jsonRes({ data: [] });
+    probe._activityNextAt = 0;
+    await probe.probe();
+    await settle();
+    assert.equal(warned.filter((l) => l.includes("activity") && l.includes("recovered")).length, 1);
+    assert.ok(probe.routerActivity);
+    assert.ok(probe._activityNextAt - Date.now() <= MIN, "success returns to the normal cadence");
+  } finally {
+    console.warn = warn;
+  }
 });
 
 // ─── promptTps ──────────────────────────────────────────
@@ -306,7 +414,7 @@ test("routerUnload: authenticated POST to /api/models/unload/{model}", async () 
   assert.equal(seen[0].url, "http://127.0.0.1:11434/api/models/unload/org%2Fmodel%20x");
   assert.equal(seen[0].opts.method, "POST");
   assert.notEqual(seen[0].opts.authenticated, false, "the router key must be sent");
-  assert.equal(seen[0].opts.timeoutMs, 60_000);
+  assert.equal(seen[0].opts.longLived, undefined, "an unload is short-lived");
 
   probe._fetch = async () => textRes("model not found", 404);
   assert.deepEqual(await probe.routerUnload("nope"), { ok: false, status: 404, message: "model not found" });
@@ -314,6 +422,30 @@ test("routerUnload: authenticated POST to /api/models/unload/{model}", async () 
     throw new Error("ECONNREFUSED");
   };
   assert.deepEqual(await probe.routerUnload("x"), { ok: false, status: 0, message: "ECONNREFUSED" });
+});
+
+test("routerUnload / routerLoad: '.' and '..' are refused without any request", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  let fetched = 0;
+  probe._fetch = async () => {
+    fetched++;
+    return textRes("OK");
+  };
+  for (const id of [".", ".."]) {
+    const out = await probe.routerUnload(id);
+    assert.equal(out.ok, false);
+    assert.deepEqual(probe.routerLoad(id), { started: false, reason: "invalid" });
+  }
+  assert.equal(fetched, 0);
+  assert.equal(probe._routerLoadInFlight, false, "a refused load does not occupy the slot");
+});
+
+test("runningModels: the model names of the last /running rows, [] when not a router", async () => {
+  const probe = new LlmProbe({ isLocal: true }, 11434);
+  assert.deepEqual(probe.runningModels(), []);
+  probe._fetch = pollingFetch({ running: [EMBEDDER, { model: "ornith-35b", state: "starting" }], prompt: 0, activity: () => jsonRes({ data: [] }) }).fetch;
+  await probe.probe();
+  assert.deepEqual(probe.runningModels(), ["qwen3-embedding", "ornith-35b"]);
 });
 
 test("routerLoad: GET /upstream/{model}/health, one load in flight, flag cleared after", async () => {
@@ -334,7 +466,7 @@ test("routerLoad: GET /upstream/{model}/health, one load in flight, flag cleared
     assert.deepEqual(probe.routerLoad("other"), { started: false, reason: "busy" });
     assert.equal(seen.length, 1);
     assert.equal(seen[0].url, "http://127.0.0.1:11434/upstream/ornith-35b/health");
-    assert.equal(seen[0].opts.timeoutMs, 20 * 60_000);
+    assert.equal(seen[0].opts.longLived, true, "a load blocks until the model is up, so it is exempt from the idle cut");
 
     release();
     await new Promise((r) => setImmediate(r));

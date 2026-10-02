@@ -22,6 +22,13 @@ interface SparklineProps {
    * last / min / max / avg of the plotted samples in this unit.
    */
   unit?: string;
+  /**
+   * Formats one value for the `<title>` tooltip, replacing the default
+   * `<number><unit>` rendering — for when the plotted data is in one unit and the
+   * reader wants another (e.g. a °C history shown in °F). Enables the tooltip
+   * on its own, without `unit`.
+   */
+  format?: (v: number) => string;
   /** Accessible name for the chart (sets role="img" + aria-label). */
   ariaLabel?: string;
 }
@@ -39,6 +46,7 @@ export function Sparkline({
   area = true,
   stretch = false,
   unit,
+  format,
   ariaLabel,
 }: SparklineProps) {
   if (data.length < 2) {
@@ -61,9 +69,9 @@ export function Sparkline({
     return `${x},${y}`;
   });
   const titleText =
-    unit !== undefined
+    unit !== undefined || format !== undefined
       ? (() => {
-          const fmt = (v: number) => `${Number(v.toFixed(1))}${unit}`;
+          const fmt = format ?? ((v: number) => `${Number(v.toFixed(1))}${unit}`);
           const dMin = Math.min(...data);
           const dMax = Math.max(...data);
           const avg = data.reduce((a, b) => a + b, 0) / data.length;

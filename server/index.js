@@ -9,6 +9,7 @@ import { SparkRegistry } from "./sparks/SparkRegistry.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
 import { sshExec } from "./collectors/ssh.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
+import { routerActionVerdict, videoCancelVerdict } from "./collectors/swapRouter.js";
 import {
   validateSparkTarget,
   createRateLimiter,
@@ -555,14 +556,9 @@ app.post("/api/sparks/:id/video/cancel", async (req, res) => {
     const mon = monitors.get(req.params.id);
     if (!spark || !mon?.videoProbe) return res.status(404).json({ error: "Video studio not found" });
     const promptId = req.body?.promptId;
-    if (!promptId || typeof promptId !== "string" || promptId.length > 64) {
-      return res.status(400).json({ error: "promptId is required (max 64 characters)" });
-    }
     const port = mon.videoProbe.studioPort();
-    if (port == null) return res.status(409).json({ error: "No video studio is resident" });
-    if (!mon.videoProbe.hasJob(promptId)) {
-      return res.status(409).json({ error: "Job is not in the studio queue" });
-    }
+    const verdict = videoCancelVerdict({ promptId, studioPort: port, jobState: mon.videoProbe.hasJob(promptId) });
+    if (verdict) return res.status(verdict.status).json({ error: verdict.error });
     const result = await comfyCancelJob(spark, promptId, port);
     void mon._pollDomain("video");
     res.json({ success: result.ok, ...result });
@@ -598,10 +594,11 @@ app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
 
 /**
  * Shared prelude of the llama-swap router action routes: resolve the spark and the
- * router probe named by the body, and validate `{port, model}`. Sends the error
- * response itself and returns null when the request cannot proceed.
+ * router probe named by the body, then ask `routerActionVerdict` whether the action
+ * may proceed. Sends the error response itself and returns null when it may not.
+ * @param {"load" | "unload"} action
  */
-function resolveRouterAction(req, res) {
+function resolveRouterAction(req, res, action) {
   const spark = registry.getSpark(req.params.id);
   const mon = monitors.get(req.params.id);
   if (!spark || !mon) {
@@ -609,7 +606,7 @@ function resolveRouterAction(req, res) {
     return null;
   }
   const { port, model } = req.body || {};
-  if (!Number.isInteger(port) || typeof model !== "string" || !model || model.length > 200) {
+  if (!Number.isInteger(port)) {
     res.status(400).json({ error: "port (number) and model (string, max 200 characters) are required" });
     return null;
   }
@@ -622,18 +619,20 @@ function resolveRouterAction(req, res) {
     res.status(400).json({ error: `Port ${port} is not a llama-swap router` });
     return null;
   }
+  const verdict = routerActionVerdict({
+    action,
+    model,
+    runningModels: probe.runningModels(),
+    studio: probe.studio,
+    routerModels: probe.routerModels,
+    video: mon.snapshot().metrics.video ?? null,
+    loadInFlight: probe.isLoadInFlight(),
+  });
+  if (verdict) {
+    res.status(verdict.status).json({ error: verdict.error });
+    return null;
+  }
   return { mon, probe, model };
-}
-
-/** The video studio's name and render counts, from the monitor's last video snapshot. */
-function videoStudioLoad(mon) {
-  const video = mon.snapshot().metrics.video;
-  const studio = video?.studio ?? null;
-  return {
-    studio,
-    running: video?.queueRunning ?? 0,
-    queued: video?.queuePending ?? 0,
-  };
 }
 
 // Unload one model behind a llama-swap router.
@@ -642,18 +641,9 @@ app.post("/api/sparks/:id/llm/router/unload", async (req, res) => {
     return rejectLimited(res, "Too many unload requests; try again shortly");
   }
   try {
-    const target = resolveRouterAction(req, res);
+    const target = resolveRouterAction(req, res, "unload");
     if (!target) return;
     const { mon, probe, model } = target;
-    if (!probe._routerRows?.some((r) => r.model === model)) {
-      return res.status(409).json({ error: `${model} is not running` });
-    }
-    const { studio, running, queued } = videoStudioLoad(mon);
-    if (studio?.model === model && running + queued > 0) {
-      return res.status(409).json({
-        error: `Video studio ${studio.name || model} has ${running} running and ${queued} queued render(s); cancel the renders first`,
-      });
-    }
     const result = await probe.routerUnload(model);
     void mon._pollDomain("llm");
     if (!result.ok) return res.status(502).json({ error: result.message });
@@ -669,22 +659,11 @@ app.post("/api/sparks/:id/llm/router/load", async (req, res) => {
     return rejectLimited(res, "Too many load requests; try again shortly");
   }
   try {
-    const target = resolveRouterAction(req, res);
+    const target = resolveRouterAction(req, res, "load");
     if (!target) return;
-    const { mon, probe, model } = target;
-    const known = probe.routerModels.find((m) => m.id === model);
-    if (!known) return res.status(409).json({ error: `${model} is not a configured model` });
-    if (known.loaded || probe._routerRows?.some((r) => r.model === model)) {
-      return res.status(409).json({ error: `${model} is already loaded` });
-    }
-    const { studio, running, queued } = videoStudioLoad(mon);
-    if (studio && studio.state !== "unloaded" && running + queued > 0) {
-      return res.status(409).json({
-        error: `GPU held by video studio ${studio.name || studio.model} (${running} running, ${queued} queued)`,
-      });
-    }
+    const { probe, model } = target;
     if (!probe.routerLoad(model).started) {
-      return res.status(409).json({ error: "A model load is already in flight" });
+      return res.status(409).json({ error: "A model load could not be started" });
     }
     res.status(202).json({ success: true, status: "loading" });
   } catch (err) {
@@ -1937,7 +1916,7 @@ async function shutdown(signal) {
     console.warn("[sparkDash] LLM dispatcher close timed out; destroyed open sockets");
   }
   try {
-    metricsHistory.flush();
+    metricsHistory.flushAll();
   } catch (err) {
     console.error("[sparkDash] failed to flush metrics history:", err.message);
   }

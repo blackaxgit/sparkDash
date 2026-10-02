@@ -336,7 +336,8 @@ export function VideoPanel({ video, sparkId, className = "" }: VideoPanelProps) 
       setActionError(null);
       setCancellingId(promptId);
       try {
-        await cancelVideoJob(sparkId, promptId);
+        const res = await cancelVideoJob(sparkId, promptId);
+        if (res.success === false) setActionError(res.message ?? "Cancel failed");
       } catch (err) {
         setActionError(err instanceof Error ? err.message : String(err));
       } finally {

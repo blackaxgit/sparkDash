@@ -239,6 +239,33 @@ test("domains do not poll while a liveness check says offline, and resume when i
   assert.equal(gpuPolls, 2, "polling resumes once liveness flips back");
 });
 
+test("a restart forgets the previous run's offline verdict", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(globalThis, "setInterval", () => Symbol("interval"));
+  t.mock.method(globalThis, "clearInterval", () => {});
+  const monitor = new SparkMonitor(spark());
+  monitor._poll = async () => {};
+  let gpuPolls = 0;
+  monitor.collector.collectGpu = async () => {
+    gpuPolls += 1;
+    return tagged(validGpu());
+  };
+  monitor.collector.pingHost = async () => {
+    throw new Error("unreachable");
+  };
+
+  monitor.start();
+  await monitor._checkOnline();
+  await monitor._pollDomain("gpu");
+  assert.equal(gpuPolls, 0, "confirmed offline: domain skipped");
+
+  monitor.stop();
+  monitor.start();
+  await monitor._pollDomain("gpu");
+  assert.equal(gpuPolls, 1, "new run polls until its own liveness check says otherwise");
+  monitor.stop();
+});
+
 test("a storage refresh from an earlier run cannot commit or clear a restarted refresh", async (t) => {
   t.mock.method(console, "log", () => {});
   t.mock.method(globalThis, "setInterval", () => Symbol("interval"));

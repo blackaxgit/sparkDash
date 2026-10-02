@@ -19,6 +19,8 @@ import {
   pickNewestEngine,
   diffRouterRows,
   buildRouterActivity,
+  ACTIVITY_LIMIT,
+  isSafePathId,
   parseRouterModels,
   promptTokensFromMetrics,
 } from "./swapRouter.js";
@@ -33,6 +35,8 @@ const MODELS_MAX_BYTES = 512 * 1024;
 const ROUTER_REFRESH_MS = 60_000;
 /** An activity endpoint that 404s (older llama-swap) is asked again this rarely. */
 const ACTIVITY_MISSING_BACKOFF_MS = 10 * 60_000;
+/** A failing activity/model read backs off 1, 2, 4… minutes up to this cap. */
+const ROUTER_FEED_BACKOFF_MAX_MS = 10 * 60_000;
 const ACTIVITY_TIMEOUT_MS = 5_000;
 const ROUTER_UNLOAD_TIMEOUT_MS = 60_000;
 /** A model load queued behind a video studio can wait a long time. */
@@ -133,7 +137,7 @@ export class LlmProbe {
     this._routerRows = null;
     /** Per-model state of the previous poll, for event diffing. Null until the first poll seeds it. */
     this._routerPrev = null;
-    /** @type {import("../../src/api/types").LlmRouterEvent[]} Newest first, max 30. */
+    /** @type {import("../../src/api/types").LlmRouterEvent[]} Newest first, max 10. */
     this.routerEvents = [];
     /** @type {import("../../src/api/types").LlmRouterActivity | null} */
     this.routerActivity = null;
@@ -141,6 +145,11 @@ export class LlmProbe {
     this.routerModels = [];
     this._activityNextAt = 0;
     this._modelsNextAt = 0;
+    /** In-flight background reads (single-flight); null when idle. */
+    this._activityRun = null;
+    this._modelsRun = null;
+    /** Consecutive failures and logged state per router feed, for backoff and log-once. */
+    this._feedHealth = { activity: { fails: 0, failing: false }, models: { fails: 0, failing: false } };
     /** True while a fire-and-forget model load is outstanding. */
     this._routerLoadInFlight = false;
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
@@ -788,7 +797,13 @@ export class LlmProbe {
     const diff = diffRouterRows(this._routerPrev, rows, polledAt, this.routerEvents);
     this._routerPrev = diff.state;
     this.routerEvents = diff.events;
-    await Promise.all([this._refreshRouterActivity(polledAt), this._refreshRouterModels(polledAt)]);
+    // Slow, non-essential feeds: never hold up the 2 s poll. Each is single-flight.
+    this._activityRun ??= this._refreshRouterActivity(polledAt).finally(() => {
+      this._activityRun = null;
+    });
+    this._modelsRun ??= this._refreshRouterModels(polledAt).finally(() => {
+      this._modelsRun = null;
+    });
 
     // A ComfyUI studio is a llama-swap member but not an LLM engine: it has no
     // /metrics and no chat API, so it must stay out of engine selection, the
@@ -1001,42 +1016,90 @@ export class LlmProbe {
     return rows;
   }
 
+  /**
+   * Record one router-feed outcome. Logs once per ok↔failing change and returns
+   * how long to leave the feed alone (0 after a success).
+   * @param {"activity" | "models"} feed
+   * @param {string | null} failure what went wrong, or null on success
+   * @param {string} path URL path, for the log
+   */
+  _noteRouterFeed(feed, failure, path) {
+    const h = this._feedHealth[feed];
+    if (failure == null) {
+      if (h.failing) console.warn(`[LlmProbe] router ${feed} ${path} on :${this.port} recovered`);
+      h.fails = 0;
+      h.failing = false;
+      return 0;
+    }
+    h.fails += 1;
+    if (!h.failing) {
+      h.failing = true;
+      console.warn(`[LlmProbe] router ${feed} ${path} on :${this.port} failing: ${failure}`);
+    }
+    return Math.min(ROUTER_FEED_BACKOFF_MAX_MS, ROUTER_REFRESH_MS * 2 ** (h.fails - 1));
+  }
+
   /** Request outcomes from llama-swap's activity log; keeps the previous value on failure. */
   async _refreshRouterActivity(now) {
     if (now < this._activityNextAt) return;
     this._activityNextAt = now + ROUTER_REFRESH_MS;
+    const path = "/api/metrics/activity";
+    let failure = null;
     try {
       const start = encodeURIComponent(new Date(now - 24 * 3_600_000).toISOString());
-      const res = await this._fetch(`${this.baseUrl}/api/metrics/activity?limit=999&start=${start}`, {
+      const res = await this._fetch(`${this.baseUrl}${path}?limit=${ACTIVITY_LIMIT}&start=${start}`, {
         timeoutMs: ACTIVITY_TIMEOUT_MS,
       });
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
-        if (res.status === 404) this._activityNextAt = now + ACTIVITY_MISSING_BACKOFF_MS;
-        return;
+        if (res.status === 404) {
+          this._activityNextAt = now + ACTIVITY_MISSING_BACKOFF_MS;
+          return;
+        }
+        failure = `HTTP ${res.status}`;
+      } else {
+        const activity = buildRouterActivity(await readJsonCapped(res, ACTIVITY_MAX_BYTES), now);
+        if (activity) this.routerActivity = activity;
+        else failure = "unexpected payload";
       }
-      const activity = buildRouterActivity(await readJsonCapped(res, ACTIVITY_MAX_BYTES), now);
-      if (activity) this.routerActivity = activity;
-    } catch {
-      /* keep the previous value */
+    } catch (err) {
+      failure = err?.message || String(err);
     }
+    const backoff = this._noteRouterFeed("activity", failure, path);
+    if (backoff) this._activityNextAt = now + backoff;
   }
 
   /** Configured models from /v1/models; keeps the previous list on failure. */
   async _refreshRouterModels(now) {
     if (now < this._modelsNextAt) return;
     this._modelsNextAt = now + ROUTER_REFRESH_MS;
+    const path = "/v1/models";
+    let failure = null;
     try {
-      const res = await this._fetch(`${this.baseUrl}/v1/models`);
+      const res = await this._fetch(`${this.baseUrl}${path}`);
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
-        return;
+        failure = `HTTP ${res.status}`;
+      } else {
+        const models = parseRouterModels(await readJsonCapped(res, MODELS_MAX_BYTES));
+        if (models) this.routerModels = models;
+        else failure = "unexpected payload";
       }
-      const models = parseRouterModels(await readJsonCapped(res, MODELS_MAX_BYTES));
-      if (models) this.routerModels = models;
-    } catch {
-      /* keep the previous list */
+    } catch (err) {
+      failure = err?.message || String(err);
     }
+    const backoff = this._noteRouterFeed("models", failure, path);
+    if (backoff) this._modelsNextAt = now + backoff;
+  }
+
+  /** Model names in the router's last /running rows; [] when this is not a router or nothing was read. */
+  runningModels() {
+    return this.router === "llama-swap" && this._routerRows ? this._routerRows.map((r) => r.model) : [];
+  }
+
+  /** True while a fire-and-forget model load is outstanding. */
+  isLoadInFlight() {
+    return this._routerLoadInFlight;
   }
 
   /**
@@ -1045,6 +1108,7 @@ export class LlmProbe {
    * @returns {Promise<{ok: boolean, status: number, message: string}>}
    */
   async routerUnload(model) {
+    if (!isSafePathId(model)) return { ok: false, status: 400, message: "invalid model id" };
     try {
       const res = await this._fetch(
         `${this.baseUrl}/api/models/unload/${encodeURIComponent(model)}`,
@@ -1067,9 +1131,10 @@ export class LlmProbe {
    * Ask llama-swap to load one model by requesting its health endpoint, which
    * blocks until the model is up. Fire-and-forget; one load in flight per probe.
    * @param {string} model
-   * @returns {{started: true} | {started: false, reason: "busy"}}
+   * @returns {{started: true} | {started: false, reason: "busy" | "invalid"}}
    */
   routerLoad(model) {
+    if (!isSafePathId(model)) return { started: false, reason: "invalid" };
     if (this._routerLoadInFlight) return { started: false, reason: "busy" };
     this._routerLoadInFlight = true;
     const t0 = Date.now();

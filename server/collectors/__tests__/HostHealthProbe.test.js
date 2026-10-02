@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   HostHealthProbe,
   HOST_HEALTH_SCRIPT,
@@ -262,4 +266,25 @@ test("probe: exec failure yields available:false with error, never throws", asyn
   assert.equal(h.error, "ssh down");
   assert.equal(h.level, "ok");
   assert.deepEqual(h.failedUnits, []);
+});
+
+test("script: a hung journalctl nulls only the xid section", () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "hhp-bin-"));
+  const stub = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  // Stand-in for coreutils `timeout`: journalctl "times out" (124), everything else runs.
+  stub("timeout", 'shift\nif [ "$1" = journalctl ]; then exit 124; fi\nexec "$@"');
+  stub("smartctl", `echo '${SMART}'`);
+  stub("journalctl", "echo '[Mon] NVRM: Xid (PCI:0000:01:00): 79, fallen off the bus'");
+  try {
+    const out = execFileSync("sh", ["-c", HOST_HEALTH_SCRIPT], {
+      env: { PATH: `${bin}:/usr/bin:/bin` },
+      encoding: "utf8",
+    });
+    const h = parseHostHealth(out);
+    assert.equal(h.xid24h, null, "timed-out journalctl must not look like zero Xids");
+    assert.equal(h.lastXid, null);
+    assert.equal(h.nvme?.tempC, 63, "other sections are unaffected");
+  } finally {
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
 });

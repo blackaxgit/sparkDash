@@ -335,7 +335,11 @@ export function SparkPage({
         )}
         {resourcesOpen && (
           <div className="md:col-span-2">
-            <HistoryPanel sparkId={spark.id} llmPorts={llmOn ? llmPorts : []} />
+            <HistoryPanel
+              sparkId={spark.id}
+              llmPorts={llmOn ? llmPorts : []}
+              temperatureUnit={temperatureUnit}
+            />
           </div>
         )}
         {/*

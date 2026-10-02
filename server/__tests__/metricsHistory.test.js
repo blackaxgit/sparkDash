@@ -255,7 +255,7 @@ test("long tier survives a restart through its own file", () => {
   const first = new MetricsHistoryStore(file);
   first.recordSnapshot(longSnap({ usage: 10 }), T);
   first.recordSnapshot(longSnap({ usage: 20 }), T + MIN); // commits minute T
-  first.flush();
+  first.flushAll();
   assert.ok(fs.existsSync(file.replace(/\.json$/, "-long.json")));
 
   const restored = new MetricsHistoryStore(file);
@@ -301,9 +301,69 @@ test("long tier drops a removed spark's series from memory and disk", () => {
   const store = new MetricsHistoryStore(file);
   store.recordSnapshot([...longSnap({ id: "spark-1" }), ...longSnap({ id: "spark-2" })], T);
   store.recordSnapshot(longSnap({ id: "spark-2" }), T + MIN);
-  store.flush();
+  store.flushAll();
 
   assert.deepEqual(store.getRange("spark-1", "1h", T + MIN).series, {});
   assert.ok(store.getRange("spark-2", "1h", T + MIN).series["gpu.usage"]);
   assert.deepEqual(new MetricsHistoryStore(file).getRange("spark-1", "1h", T + MIN).series, {});
+});
+
+test("a failed GPU collection leaves the long-tier gpu keys as gaps, not zeros", () => {
+  const store = new MetricsHistoryStore(tmpFile());
+  const snap = longSnap({ extra: { ram: { percentage: 40 } } });
+  snap[0].metrics.gpu = { collected: false, usage: 0, temperature: 0, power: { draw: 0 } };
+  store.recordSnapshot(snap, T);
+
+  const series = store.getRange("spark-1", "1h", T + 1000).series;
+  assert.equal(series["gpu.usage"], undefined);
+  assert.equal(series["gpu.temp"], undefined);
+  assert.equal(series["gpu.power"], undefined);
+  assert.equal(valueAt({ series }, "mem.percentage", T), 40);
+});
+
+test("a corrupt long file is moved aside with a warning and the store starts empty", (t) => {
+  const file = tmpFile();
+  const longFile = file.replace(/\.json$/, "-long.json");
+  fs.writeFileSync(longFile, "{not json");
+  const warn = t.mock.method(console, "warn", () => {});
+
+  const store = new MetricsHistoryStore(file);
+
+  assert.equal(store._long.size, 0);
+  assert.equal(fs.existsSync(longFile), false);
+  const moved = fs
+    .readdirSync(dir)
+    .filter((f) => f.startsWith(`${path.basename(longFile)}.corrupt-`));
+  assert.equal(moved.length, 1);
+  assert.equal(fs.readFileSync(path.join(dir, moved[0]), "utf8"), "{not json");
+  assert.equal(warn.mock.callCount(), 1);
+  assert.ok(String(warn.mock.calls[0].arguments[0]).includes(longFile));
+});
+
+test("five minutes of 1s ticks rewrite the long file at most once; the short flush never does", (t) => {
+  const start = Math.floor(Date.now() / MIN) * MIN;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: start });
+  const file = tmpFile();
+  const store = new MetricsHistoryStore(file);
+  let longWrites = 0;
+  const realFlushLong = store.flushLong.bind(store);
+  store.flushLong = () => {
+    if (store._longDirty) longWrites++;
+    realFlushLong();
+  };
+
+  for (let s = 0; s < 300; s++) {
+    store.recordSnapshot(longSnap({ usage: s % 100 }), Date.now());
+    t.mock.timers.tick(1000);
+  }
+  assert.ok(longWrites <= 1, `long file rewritten ${longWrites} times in 5 minutes`);
+  assert.ok(fs.existsSync(file), "short tier was not flushed on its 30s timer");
+
+  // The 5-minute long timer armed at the first minute boundary fires at 6:00.
+  for (let s = 300; s < 390; s++) {
+    store.recordSnapshot(longSnap({ usage: s % 100 }), Date.now());
+    t.mock.timers.tick(1000);
+  }
+  assert.equal(longWrites, 1);
+  assert.ok(fs.existsSync(file.replace(/\.json$/, "-long.json")));
 });

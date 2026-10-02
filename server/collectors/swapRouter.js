@@ -146,7 +146,7 @@ export function pickNewestEngine(candidates) {
   return best;
 }
 
-const EVENT_CAP = 30;
+const EVENT_CAP = 10;
 
 /**
  * Diff one /running poll against the previous one. `prev` is the state this
@@ -187,6 +187,9 @@ export function diffRouterRows(prev, rows, now, events) {
   }
   return { state, events: [...fresh.reverse(), ...events].slice(0, EVENT_CAP) };
 }
+
+/** Page size requested from /api/metrics/activity; a full page means older rows were cut off. */
+export const ACTIVITY_LIMIT = 999;
 
 const HOUR_MS = 3_600_000;
 const ERROR_ROWS = 5;
@@ -235,7 +238,13 @@ export function buildRouterActivity(payload, now) {
     }
   }
   errors.sort((a, b) => b.at - a.at);
-  return { hourly, lastHour, recentErrors: errors.slice(0, ERROR_ROWS), updatedAt: now };
+  return {
+    hourly,
+    lastHour,
+    recentErrors: errors.slice(0, ERROR_ROWS),
+    truncated: data.length >= ACTIVITY_LIMIT,
+    updatedAt: now,
+  };
 }
 
 const MAX_MODELS = 200;
@@ -254,7 +263,7 @@ export function parseRouterModels(payload) {
     if (!m || typeof m !== "object" || !isSwapOwner(m.owned_by)) continue;
     if (m.meta?.llamaswap?.type === "alias") continue;
     const id = boundedString(m.id);
-    if (!id) continue;
+    if (!id || !isSafePathId(id)) continue;
     out.push({ id, name: boundedString(m.name), loaded: m.status?.value === "loaded" });
     if (out.length >= MAX_MODELS) break;
   }
@@ -287,5 +296,126 @@ export function promptTokensFromMetrics(txt) {
     }
     if (found) return sum;
   }
+  return null;
+}
+
+/**
+ * A model or prompt id that is safe to put in one URL path segment.
+ * `encodeURIComponent` leaves "." and ".." untouched, and the URL parser then
+ * resolves them against the path, so `/unload/..` reaches a different route.
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isSafePathId(id) {
+  return typeof id === "string" && id !== "" && id !== "." && id !== "..";
+}
+
+const MAX_MODEL_ID_CHARS = 200;
+const MAX_PROMPT_ID_CHARS = 64;
+
+/**
+ * The video studio holding the GPU among the router's running rows, or null.
+ * A studio row is the probe's own detection (`studio`, from the per-row ComfyUI
+ * check) or a running row equal to the video snapshot's studio.
+ * @param {string[]} runningModels
+ * @param {{ model: string, name?: string | null } | null | undefined} studio
+ * @param {any} video
+ * @returns {{ model: string, name: string } | null}
+ */
+function residentStudio(runningModels, studio, video) {
+  const fromProbe = studio?.model && runningModels.includes(studio.model) ? studio : null;
+  const vs = video?.studio;
+  const fromVideo = vs?.model && runningModels.includes(vs.model) ? vs : null;
+  const pick = fromProbe ?? fromVideo;
+  if (!pick) return null;
+  return { model: pick.model, name: pick.name || fromVideo?.name || fromProbe?.name || pick.model };
+}
+
+/**
+ * Whether the studio's render queue is known and empty. Fails closed: with no
+ * snapshot, an unavailable one, or one that names another studio, the queue
+ * is unknown and the GPU must be treated as held.
+ * @param {{ model: string }} resident
+ * @param {any} video
+ * @returns {{ kind: "unknown" } | { kind: "busy", running: number, queued: number } | { kind: "idle" }}
+ */
+function studioQueue(resident, video) {
+  if (!video || video.available !== true || video.studio?.model !== resident.model) {
+    return { kind: "unknown" };
+  }
+  const running = Number(video.queueRunning) || 0;
+  const queued = Number(video.queuePending) || 0;
+  return running + queued > 0 ? { kind: "busy", running, queued } : { kind: "idle" };
+}
+
+/**
+ * Decide whether a llama-swap load/unload may proceed. Pure: the route does the I/O.
+ * @param {object} p
+ * @param {"load" | "unload"} p.action
+ * @param {unknown} p.model
+ * @param {string[]} p.runningModels models in the router's last /running rows
+ * @param {{ model: string, name?: string | null } | null} p.studio the probe's detected studio
+ * @param {Array<{ id: string, loaded: boolean }>} p.routerModels configured models
+ * @param {any} p.video the monitor's last video snapshot (may be missing)
+ * @param {boolean} p.loadInFlight
+ * @returns {null | { status: number, error: string }} null = allowed
+ */
+export function routerActionVerdict({ action, model, runningModels, studio, routerModels, video, loadInFlight }) {
+  if (typeof model !== "string" || !model || model.length > MAX_MODEL_ID_CHARS || !isSafePathId(model)) {
+    return { status: 400, error: "model must be a model id (max 200 characters, not '.' or '..')" };
+  }
+  const running = runningModels.includes(model);
+  const resident = residentStudio(runningModels, studio, video);
+  const queue = resident ? studioQueue(resident, video) : null;
+  const unknown = () => ({ status: 409, error: `GPU held by video studio ${resident?.name} (state unknown)` });
+
+  if (action === "unload") {
+    if (!running) return { status: 409, error: `${model} is not running` };
+    if (resident?.model === model && queue) {
+      if (queue.kind === "unknown") return unknown();
+      if (queue.kind === "busy") {
+        return {
+          status: 409,
+          error: `Video studio ${resident.name} has ${queue.running} running and ${queue.queued} queued render(s); cancel the renders first`,
+        };
+      }
+    }
+    return null;
+  }
+
+  if (!routerModels.some((m) => m.id === model)) {
+    return { status: 409, error: `${model} is not a configured model` };
+  }
+  if (routerModels.some((m) => m.id === model && m.loaded)) {
+    return { status: 409, error: `${model} is already loaded` };
+  }
+  if (running) return { status: 409, error: `${model} is already running or loading` };
+  if (resident && queue) {
+    if (queue.kind === "unknown") return unknown();
+    if (queue.kind === "busy") {
+      return {
+        status: 409,
+        error: `GPU held by video studio ${resident.name} (${queue.running} running, ${queue.queued} queued)`,
+      };
+    }
+  }
+  if (loadInFlight) return { status: 409, error: "A model load is already in flight" };
+  return null;
+}
+
+/**
+ * Decide whether a studio render may be cancelled. Pure: the route does the I/O.
+ * @param {object} p
+ * @param {unknown} p.promptId
+ * @param {number | null} p.studioPort port of the resident, ready studio, else null
+ * @param {"running" | "pending" | null} p.jobState where the prompt sits in the studio queue
+ * @returns {null | { status: number, error: string }} null = allowed
+ */
+export function videoCancelVerdict({ promptId, studioPort, jobState }) {
+  if (typeof promptId !== "string" || !promptId || promptId.length > MAX_PROMPT_ID_CHARS || !isSafePathId(promptId)) {
+    return { status: 400, error: "promptId is required (max 64 characters, not '.' or '..')" };
+  }
+  if (studioPort == null) return { status: 409, error: "No video studio is resident" };
+  if (jobState == null) return { status: 409, error: "Job is not in the studio queue" };
   return null;
 }
