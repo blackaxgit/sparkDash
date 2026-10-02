@@ -169,6 +169,26 @@ export function GridIcon({ className = "" }: { className?: string }) {
   );
 }
 
+/** Services laid out as two side-by-side columns. */
+export function ColumnsIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg {...baseProps(className)}>
+      <rect x="3" y="4" width="7.5" height="16" rx="1.5" />
+      <rect x="13.5" y="4" width="7.5" height="16" rx="1.5" />
+    </svg>
+  );
+}
+
+/** Services stacked as full-width rows. */
+export function RowsIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg {...baseProps(className)}>
+      <rect x="3" y="4" width="18" height="6.5" rx="1.5" />
+      <rect x="3" y="13.5" width="18" height="6.5" rx="1.5" />
+    </svg>
+  );
+}
+
 export function MemoryIcon({ className = "" }: { className?: string }) {
   return (
     <svg {...baseProps(className)}>

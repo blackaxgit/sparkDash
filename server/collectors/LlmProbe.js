@@ -7,6 +7,20 @@
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
 import { classifyHostScope } from "../validate.js";
 import { llmProbeHost } from "./llmHost.js";
+import { generationTokensFromMetrics } from "./LlmStreaming.js";
+import {
+  isSwapOwner,
+  parseRunning,
+  isReadyState,
+  isLoadingState,
+  upstreamBase,
+  processStartTime,
+  pickNewestEngine,
+} from "./swapRouter.js";
+import { detectComfyUpstream, isKnownComfyModel, noteComfyModel, readJsonCapped } from "./comfyDetect.js";
+
+/** llama-swap /running lists a handful of rows; a bigger body is hostile or broken. */
+const RUNNING_MAX_BYTES = 256 * 1024;
 
 const FAIL_RESET_THRESHOLD = 3;
 const REDETECT_INTERVAL_MS = 60_000;
@@ -19,6 +33,12 @@ const SGLANG_MODEL_INFO_PATHS = ["/model_info", "/get_model_info"];
  * expire back to 0 if it stops changing.
  */
 const SGLANG_STICKY_TPS_LIVE_MS = 6_000;
+/**
+ * Consecutive failed scrapes of the followed engine before the panel hands
+ * over to another resident one. A busy engine can miss a 3 s probe; only a
+ * run of misses means it is really gone.
+ */
+const SWAP_FAILOVER_MISSES = 3;
 
 /**
  * Prefer a short model id when the server returns a Hugging Face hub cache path.
@@ -68,6 +88,31 @@ export class LlmProbe {
     // State
     this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
+    /** "llama-swap" when this port is a model router, else null. */
+    this.router = null;
+    /** Router key of the engine the panel is showing (what clients must send). */
+    this.routerModel = null;
+    /** Human label for that model from the router config. */
+    this.routerModelName = null;
+    /** Router key of a model that is mid-load (cold start), else null. */
+    this.routerLoading = null;
+    /** Resident ComfyUI video studio holding the GPU (not an LLM engine), else null. */
+    this.studio = null;
+    /** True once the resolved engine's /v1/models has been read. */
+    this._engineInfoRead = false;
+    /** Models holding memory behind the router right now. */
+    this.routerResident = 0;
+    /** Base URL of the resolved upstream engine, else null. */
+    this.engineUrl = null;
+    /** `${model}@${processStart}` — changes on every swap or engine restart. */
+    this.engineId = null;
+    /** Consecutive polls the followed engine failed to answer. */
+    this._swapMisses = 0;
+    /**
+     * Per-resident-model generated tokens and live rate.
+     * @type {Map<string, {engineId: string, name: string|null, total: number, tps: number, at: number}>}
+     */
+    this._engineStats = new Map();
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
     this.stepId = 0;
@@ -87,6 +132,13 @@ export class LlmProbe {
 
     // Per-slot rate tracking (for llama.cpp native path)
     this.slotState = new Map();
+    /** Monotonic prefill counters rebuilt from same-task slot deltas (llama.cpp). */
+    this._llamaCachedCum = 0;
+    this._llamaComputedCum = 0;
+    /** null = untried, false = server has no /metrics (don't re-probe). */
+    this._llamaMetricsOk = null;
+    /** Monotonic tokens_predicted_total; null when /metrics did not answer. */
+    this._llamaCumulative = null;
     this.lastTokenCounts = { input: 0, output: 0 };
     /** Previous prefill counters by kind; null until first labeled sample. */
     this.lastPrefillKinds = null;
@@ -246,21 +298,61 @@ export class LlmProbe {
     }
   }
 
+  /** Forget what kind of server this is. Engine-owned state goes with it. */
   _resetDetection() {
     this.serverIsOpenAI = null;
     this.backendType = null;
     this.authOpen = null;
+    this.slotState.clear();
+    this._llamaCachedCum = 0;
+    this._llamaComputedCum = 0;
+    /** null = untried, false = server has no /metrics (don't re-probe). */
+    this._llamaMetricsOk = null;
+    /** Monotonic tokens_predicted_total; null when /metrics did not answer. */
+    this._llamaCumulative = null;
+    this._sglangStickyTps = null;
+    this.router = null;
+    this.studio = null;
+    // Owns modelId / modelPath / contextLength, every tile and every series.
+    this._clearEngine();
+  }
+
+  /**
+   * Forget the engine behind a router: identity, series and every tile that
+   * belongs to a specific process. Called on swap, engine restart and when the
+   * router has nothing loaded — otherwise the panel keeps showing the last
+   * model's KV / TTFT / MTP numbers forever.
+   */
+  _clearEngine() {
+    this.routerModel = null;
+    this.routerModelName = null;
+    this.routerLoading = null;
+    this.engineUrl = null;
+    this.engineId = null;
+    this._engineInfoRead = false;
+    this.routerResident = 0;
+    this._swapMisses = 0;
+    this._engineStats.clear();
     this.modelId = null;
     this.modelPath = null;
+    this.contextLength = null;
+    this._resetEngineSeries();
+  }
+
+  /** Zero the rate/tile state that a counter reset would otherwise corrupt. */
+  _resetEngineSeries() {
+    this.lastTokenCounts = { input: 0, output: 0 };
+    this.lastPrefillKinds = null;
+    this.lastTtftSum = null;
+    this.lastIterSum = null;
     this.generationTps = 0;
     this.prefillTps = 0;
     this.cachedPrefillTps = null;
     this.uncachedPrefillTps = null;
-    this.contextLength = null;
+    this.totalOutputTokens = 0;
     this.gpuMemoryUtilization = null;
     this.slotsActive = 0;
     this.slotsTotal = 0;
-    this.totalOutputTokens = 0;
     this.totalPromptTokens = null;
     this.totalCachedTokens = null;
     this.kvCacheUsage = null;
@@ -273,13 +365,7 @@ export class LlmProbe {
     this.e2eP95Seconds = null;
     this.itlP95Seconds = null;
     this.mtpAcceptanceRate = null;
-    this.slotState.clear();
-    this.lastTokenCounts = { input: 0, output: 0 };
-    this.lastPrefillKinds = null;
-    this.lastTtftSum = null;
     this.lastTtftCount = null;
-    this.lastIterSum = null;
-    this._sglangStickyTps = null;
     this._sglangLoadGenTps = null;
   }
 
@@ -304,6 +390,7 @@ export class LlmProbe {
     // backend's access log (#15). Still probe /slots on first contact, when
     // the type is unknown, or when the backend was previously llama.cpp.
     if (
+      this.router == null &&
       this.backendType !== "vllm" &&
       this.backendType !== "sglang" &&
       this.backendType !== "ds4" &&
@@ -345,6 +432,23 @@ export class LlmProbe {
           } catch {
             /* body optional for detection */
           }
+        }
+        // llama-server reports owned_by "llamacpp". If the /slots probe
+        // failed transiently (server busy or waking from --sleep-idle-seconds),
+        // the fallback must not classify it as vLLM: that misdetection is
+        // sticky (the anti-404-spam guard above never re-probes /slots for
+        // "vllm") and blanks every metric tile.
+        if (typeof owned === "string" && /llama[._-]?cpp/i.test(owned)) {
+          this.serverIsOpenAI = false;
+          this.backendType = "llama.cpp";
+          return;
+        }
+        // llama-swap fronts N engines on one port: its model list is config,
+        // not state. Identity and metrics come from the running engine
+        // (_probeSwapRouter), so classify the backend there.
+        if (isSwapOwner(owned)) {
+          this.router = "llama-swap";
+          return;
         }
         this.backendType = await this._classifyOpenAIBackend(owned);
         return;
@@ -437,6 +541,11 @@ export class LlmProbe {
   }
 
   /** @param {string} body */
+  static _metricsLookLikeVllm(body) {
+    return typeof body === "string" && (body.includes("vllm:") || body.includes("vllm_"));
+  }
+
+  /** @param {string} body */
   static _metricsLookLikeDs4(body) {
     return /(?:^|\n)ds4_tokens_decoded_total(?:\{|\s)/m.test(String(body || ""));
   }
@@ -481,19 +590,27 @@ export class LlmProbe {
         const modelsData = await modelsRes.json();
         const model = modelsData?.data?.[0];
         servedModelId = normalizeModelId(model?.id || null);
-        this.modelId = servedModelId;
-        // Drop HF hub cache paths from modelPath if /v1/models id was a cache dir
-        if (isHfHubCachePath(model?.id)) this.modelPath = null;
-        // ds4-server uses context_length; vLLM uses max_model_len
-        this.contextLength =
-          model?.max_model_len ?? model?.context_length ?? this.contextLength;
         owned = model?.owned_by;
+        // A router's list is its config (every model and alias), so it says
+        // nothing about what is loaded — leave identity to _probeSwapRouter.
+        if (isSwapOwner(owned)) {
+          this.router = "llama-swap";
+        } else {
+          this.modelId = normalizeModelId(model?.id || null);
+          // Drop HF hub cache paths from modelPath if /v1/models id was a cache dir
+          if (isHfHubCachePath(model?.id)) this.modelPath = null;
+          // ds4-server uses context_length; vLLM uses max_model_len
+          this.contextLength =
+            model?.max_model_len ?? model?.context_length ?? this.contextLength;
+        }
       }
     } catch {}
 
     if (!modelsOk) {
       throw new Error("OpenAI-compatible /v1/models unreachable");
     }
+
+    if (this.router === "llama-swap") return this._probeSwapRouter(dtSec);
 
     // Self-heal backend from owned_by before branching (cheap, no extra HTTP)
     if (typeof owned === "string") {
@@ -582,27 +699,21 @@ export class LlmProbe {
       return this._getSnapshot();
     }
 
-    // Single /metrics fetch: ds4-server or vLLM Prometheus exposition
+    // Single /metrics fetch: ds4-server or vLLM Prometheus exposition.
+    // A router's own /metrics never lands here — _probeSwapRouter scrapes the
+    // engine it names, so there is no port to guess.
     try {
       const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
-      if (metricsRes.ok) {
-        const txt = await metricsRes.text();
-        if (
-          this.backendType === "ds4" ||
-          LlmProbe._metricsLookLikeDs4(txt)
-        ) {
-          this.backendType = "ds4";
-          this._applyDs4Metrics(txt, dtSec);
-        } else if (
-          this.backendType === "q27" ||
-          LlmProbe._metricsLookLikeQ27(txt)
-        ) {
-          this.backendType = "q27";
-          this._applyQ27Metrics(txt, dtSec);
-        } else {
-          this.backendType = "vllm";
-          this._applyVllmMetrics(txt, dtSec);
-        }
+      const txt = metricsRes.ok ? await metricsRes.text() : "";
+      if (this.backendType === "ds4" || LlmProbe._metricsLookLikeDs4(txt)) {
+        this.backendType = "ds4";
+        this._applyDs4Metrics(txt, dtSec);
+      } else if (this.backendType === "q27" || LlmProbe._metricsLookLikeQ27(txt)) {
+        this.backendType = "q27";
+        this._applyQ27Metrics(txt, dtSec);
+      } else if (LlmProbe._metricsLookLikeVllm(txt)) {
+        this.backendType = "vllm";
+        this._applyVllmMetrics(txt, dtSec);
       } else if (
         this.backendType !== "ds4" &&
         this.backendType !== "exl3" &&
@@ -621,6 +732,322 @@ export class LlmProbe {
     }
 
     return this._getSnapshot();
+  }
+
+  // ─── llama-swap router path ──────────────────────────────
+  /**
+   * Probe the engine a llama-swap proxy is actually running.
+   *
+   * The router's /v1/models is its config; /running is its state. Everything
+   * the panel shows — model, context, tok/s, tiles — comes from the engine
+   * named there, scraped at its own upstream address.
+   * @param {number} dtSec
+   */
+  async _probeSwapRouter(dtSec) {
+    let rows = null;
+    try {
+      const res = await this._fetch(`${this.baseUrl}/running`);
+      if (res.ok) rows = parseRunning(await readJsonCapped(res, RUNNING_MAX_BYTES).catch(() => null));
+      else await res.body?.cancel().catch(() => {});
+    } catch {
+      /* reported below */
+    }
+    if (rows == null) throw new Error("llama-swap /running unreachable");
+
+    // A ComfyUI studio is a llama-swap member but not an LLM engine: it has no
+    // /metrics and no chat API, so it must stay out of engine selection, the
+    // resident list and loading detection. Origins come from /running via
+    // upstreamBase — never through llama-swap's /upstream/ path.
+    // Per ROW, not per name: a /running that repeats a name across origins must not
+    // let one studio row hide an LLM row that shares its name.
+    /** @type {Set<import("./swapRouter.js").RunningRow>} */
+    const comfy = new Set();
+    await Promise.all(
+      rows.map(async (r) => {
+        if (!r.proxy || !(isReadyState(r.state) || isLoadingState(r.state))) return;
+        const base = upstreamBase(r.proxy, this.baseUrl);
+        if (!base) return;
+        // A studio that is still starting answers nothing yet; its name at this
+        // origin, learned while it was ready, keeps it from reading as a loading LLM.
+        if (isLoadingState(r.state) && isKnownComfyModel(base, r.model)) {
+          comfy.add(r);
+          return;
+        }
+        // Unauthenticated: the router's API key must not reach a studio origin.
+        const det = await detectComfyUpstream(base, {
+          fetchImpl: (u) => this._fetch(u, { authenticated: false }),
+        });
+        if (det.isComfy) {
+          comfy.add(r);
+          noteComfyModel(base, r.model);
+        }
+      })
+    );
+    const studioRow = rows.find((r) => comfy.has(r) && isReadyState(r.state) && r.proxy);
+    this.studio = studioRow ? { model: studioRow.model, name: studioRow.name } : null;
+
+    // Only an *incoming* model is "loading". During a swap the outgoing one is
+    // also non-ready ("stopping"), and naming that in the UI would tell the
+    // operator a model is arriving when it is leaving.
+    const loading = rows.find((r) => isLoadingState(r.state) && !comfy.has(r));
+    const ready = rows.filter((r) => isReadyState(r.state) && r.proxy && !comfy.has(r));
+    // How many models hold memory right now — the number that matters on a
+    // single unified pool, and the one the Slots tile has no meaning for.
+    this.routerResident = ready.length;
+    const scanned = await this._scanEngines(ready);
+    this._trackEngineTokens(scanned, Date.now());
+    const picked = this._chooseEngine(scanned);
+    if (!picked) {
+      // Router up, nothing serving: an idle panel, not a stale one.
+      this._clearEngine();
+      this.routerLoading = loading ? loading.model : null;
+      return this._getSnapshot();
+    }
+
+    // A poll that could not scrape the engine knows no start time. Keep the
+    // identity we already had for that model: treating one transient /metrics
+    // failure as two swaps would wipe the tiles, re-baseline the hourly
+    // series twice and re-read /v1/models, all for an engine that never moved.
+    const sameModel = this.engineId != null && this.routerModel === picked.row.model;
+    const engineId =
+      picked.startedAt != null
+        ? `${picked.row.model}@${picked.startedAt}`
+        : sameModel
+          ? this.engineId
+          : `${picked.row.model}@?`;
+    const engineChanged = engineId !== this.engineId;
+    if (engineChanged) {
+      // Swap or restart: counters start from zero again, so every delta and
+      // every tile from the previous engine is meaningless.
+      this._resetEngineSeries();
+      this.engineId = engineId;
+      this.backendType = null;
+      this.contextLength = null;
+      this.modelPath = null;
+      this._engineInfoRead = false;
+    }
+    this.engineUrl = picked.base;
+    this.routerModel = picked.row.model;
+    this.routerModelName = picked.row.name;
+    this.routerLoading = loading ? loading.model : null;
+    // The router key, not the upstream's served name: this is the id clients
+    // (benchmark, showcase) must send back through the proxy.
+    this.modelId = picked.row.model;
+
+    // Once per engine: an upstream that reports no context (llama.cpp) must
+    // not be re-asked every 2 s forever.
+    if (picked.base && !this._engineInfoRead) {
+      this._engineInfoRead = await this._readEngineModelInfo(picked.base);
+    }
+    // dt 0 on the first sample of an engine: store the counters as the
+    // baseline without turning "everything it ever generated" into a rate.
+    if (picked.metrics) this._applyEngineMetrics(picked.metrics, engineChanged ? 0 : dtSec);
+    else if (engineChanged) this.backendType = null;
+    return this._getSnapshot();
+  }
+
+  /**
+   * Scrape every ready engine once, then decide which one the panel follows.
+   *
+   * Every resident engine is read on every poll because the card reports each
+   * one's tokens, not just the followed model's — on a single unified pool
+   * "what else is holding memory, and is it working?" is the question the
+   * operator actually has. Bounded by parseRunning's row cap and by physics:
+   * a 121 GB pool holds two or three engines, not thirty.
+   * @param {import("./swapRouter.js").RunningRow[]} ready
+   * @returns {Promise<Array<{row: import("./swapRouter.js").RunningRow, base: string|null, metrics: string|null, startedAt: number|null}>>}
+   */
+  async _scanEngines(ready) {
+    const scanned = [];
+    for (const row of ready) {
+      const resolved = await this._readEngine(row);
+      if (resolved) scanned.push(resolved);
+    }
+    return scanned;
+  }
+
+  /**
+   * The engine the panel follows: the most recently started one that answered.
+   *
+   * A scrape can fail on a busy engine (3 s probe timeout under decode), so
+   * the engine currently being followed keeps the panel for a few polls before
+   * handing over — bouncing to an always-resident helper and back would cost
+   * two engine changes, two hourly re-baselines, and the tokens in between.
+   * @param {Awaited<ReturnType<LlmProbe["_scanEngines"]>>} scanned
+   */
+  _chooseEngine(scanned) {
+    if (!scanned.length) {
+      this._swapMisses = 0;
+      return null;
+    }
+    const followed = scanned.find((c) => c.row.model === this.routerModel);
+    if (followed && followed.metrics == null) {
+      this._swapMisses += 1;
+      if (this._swapMisses < SWAP_FAILOVER_MISSES) return followed;
+    } else {
+      this._swapMisses = 0;
+    }
+    const answered = scanned.filter((c) => c.metrics != null);
+    return pickNewestEngine(answered.length ? answered : scanned);
+  }
+
+  /**
+   * Per-engine generated tokens and live rate, for every resident model.
+   *
+   * Kept separately from the followed engine's series: each engine counts from
+   * its own start, so one shared baseline would attribute a swap-in's history
+   * to whichever model happens to be on screen.
+   * @param {Awaited<ReturnType<LlmProbe["_scanEngines"]>>} scanned
+   * @param {number} now
+   */
+  _trackEngineTokens(scanned, now) {
+    const seen = new Set();
+    for (const c of scanned) {
+      const model = c.row.model;
+      seen.add(model);
+      const id = c.startedAt != null ? `${model}@${c.startedAt}` : model;
+      const total = c.metrics != null ? generationTokensFromMetrics(c.metrics) : null;
+      const prev = this._engineStats.get(model);
+      if (!prev || prev.engineId !== id) {
+        // New process: seed, never diff across the restart.
+        this._engineStats.set(model, {
+          engineId: id,
+          name: c.row.name,
+          total: total ?? 0,
+          tps: 0,
+          at: now,
+        });
+        continue;
+      }
+      prev.name = c.row.name;
+      if (total == null) continue;
+      const dt = (now - prev.at) / 1000;
+      if (total < prev.total) prev.tps = 0;
+      else if (dt > 0 && dt < 10) prev.tps = Math.round(((total - prev.total) / dt) * 100) / 100;
+      prev.total = total;
+      prev.at = now;
+    }
+    for (const model of this._engineStats.keys()) {
+      if (!seen.has(model)) this._engineStats.delete(model);
+    }
+  }
+
+  /** Snapshot rows for the resident-models list: followed engine first. */
+  _routerEngines() {
+    const rows = [];
+    for (const [model, st] of this._engineStats) {
+      rows.push({
+        model,
+        name: st.name || null,
+        generationTps: st.tps,
+        totalOutputTokens: st.total,
+        active: model === this.routerModel,
+      });
+    }
+    rows.sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      return a.model.localeCompare(b.model);
+    });
+    return rows;
+  }
+
+  /**
+   * Resolve one running row to an engine: its Prometheus body and start time
+   * when it can be scraped, identity alone when it cannot. A ready engine
+   * started with metrics disabled, or one the router puts on a host we refuse
+   * to fetch, is still the model that is loaded — reporting "no model" there
+   * would be a lie, just a different one.
+   * @param {import("./swapRouter.js").RunningRow | undefined} row
+   */
+  async _readEngine(row) {
+    if (!row) return null;
+    const base = upstreamBase(row.proxy, this.baseUrl);
+    if (!base) return { row, base: null, metrics: null, startedAt: null };
+    try {
+      const res = await this._fetch(`${base}/metrics`);
+      if (!res.ok) return { row, base, metrics: null, startedAt: null };
+      const metrics = await res.text();
+      return { row, base, metrics, startedAt: processStartTime(metrics) };
+    } catch {
+      return { row, base, metrics: null, startedAt: null };
+    }
+  }
+
+  /**
+   * Context length and upstream repo id, straight from the engine.
+   * @param {string} base
+   * @returns {Promise<boolean>} true when the engine answered (do not re-ask).
+   */
+  async _readEngineModelInfo(base) {
+    try {
+      const res = await this._fetch(`${base}/v1/models`);
+      if (!res.ok) return false;
+      const data = await res.json();
+      const model = data?.data?.[0];
+      const ctx = model?.max_model_len ?? model?.context_length;
+      if (Number.isFinite(Number(ctx)) && Number(ctx) > 0) {
+        this.contextLength = Math.round(Number(ctx));
+      }
+      const root = model?.root || model?.id;
+      if (root && !isHfHubCachePath(root)) this.modelPath = String(root);
+      return true;
+    } catch {
+      // Engine still warming: retry on the next poll.
+      return false;
+    }
+  }
+
+  /**
+   * Apply an engine's Prometheus body, whatever engine it is.
+   * @param {string} txt
+   * @param {number} dtSec
+   */
+  _applyEngineMetrics(txt, dtSec) {
+    if (LlmProbe._metricsLookLikeDs4(txt)) {
+      this.backendType = "ds4";
+      this._applyDs4Metrics(txt, dtSec);
+    } else if (txt.includes("sglang:") || txt.includes("sglang_")) {
+      this.backendType = "sglang";
+      this._applySglangMetrics(txt, dtSec);
+    } else if (txt.includes("llamacpp:")) {
+      this.backendType = "llama.cpp";
+      this._applyLlamaCppMetrics(txt, dtSec);
+    } else if (LlmProbe._metricsLookLikeVllm(txt)) {
+      this.backendType = "vllm";
+      this._applyVllmMetrics(txt, dtSec);
+    }
+  }
+
+  /**
+   * llama.cpp behind a router: /slots belongs to the engine, not the proxy, so
+   * rates come from the same monotonic counters the native path falls back to.
+   * @param {string} txt
+   * @param {number} dtSec
+   */
+  _applyLlamaCppMetrics(txt, dtSec) {
+    const predicted = this._getPromMetric(txt, "llamacpp:tokens_predicted_total");
+    const prompt = this._getPromMetric(txt, "llamacpp:prompt_tokens_total");
+    if (predicted != null && dtSec > 0 && dtSec < 10) {
+      const deltaOut = predicted - this.lastTokenCounts.output;
+      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+      if (prompt != null) {
+        this._setPrefillTps((prompt - this.lastTokenCounts.input) / dtSec, deltaOut > 0);
+      }
+    }
+    if (predicted != null) {
+      this.lastTokenCounts.output = predicted;
+      this.totalOutputTokens = predicted;
+      this._llamaCumulative = predicted;
+    }
+    if (prompt != null) this.lastTokenCounts.input = prompt;
+
+    const running = this._getPromMetric(txt, "llamacpp:requests_processing");
+    const waiting = this._getPromMetric(txt, "llamacpp:requests_deferred");
+    this.requestsRunning = running;
+    this.requestsWaiting = waiting;
+    if (running != null) this.slotsActive = Math.round(running);
+    this.kvCacheUsage = this._getPromMetric(txt, "llamacpp:kv_cache_usage_ratio");
+    this.gpuMemoryUtilization = 1;
   }
 
   /**
@@ -921,6 +1348,24 @@ export class LlmProbe {
     const genTokens = this._getVllmMetric(txt, "generation_tokens_total");
     const running = this._getVllmMetric(txt, "num_requests_running");
     const iterSum = this._getVllmMetric(txt, "iteration_tokens_total_sum");
+    // A counter that went backwards is a restarted engine, not negative work.
+    // Seed the baseline and skip this interval: without it the next poll
+    // reports the whole of the new process's history as one burst. Catches the
+    // restart that engine identity cannot, when /metrics has no
+    // process_start_time_seconds to identify the process by.
+    if (
+      (promptTokens != null && promptTokens < this.lastTokenCounts.input) ||
+      (genTokens != null && genTokens < this.lastTokenCounts.output)
+    ) {
+      this._resetEngineSeries();
+      this.lastTokenCounts = {
+        input: promptTokens ?? 0,
+        output: genTokens ?? 0,
+      };
+      this.totalOutputTokens = genTokens ?? 0;
+      if (iterSum != null) this.lastIterSum = iterSum;
+      return;
+    }
     if (promptTokens != null && genTokens != null) {
       const deltaIn = promptTokens - this.lastTokenCounts.input;
       const deltaOut = genTokens - this.lastTokenCounts.output;
@@ -981,7 +1426,19 @@ export class LlmProbe {
     this.requestsRunning = running;
     if (running != null) this.slotsActive = Math.round(running);
 
-    if (this.gpuMemoryUtilization == null) {
+    // vLLM ≥0.11 exposes engine_sleep_state as one series per state
+    // (awake / weights_offloaded / discard_all), so the unlabeled sum is
+    // always 1 and can never report Sleeping. Read the awake series when it
+    // is there, and keep the old single-gauge reading as the fallback.
+    const awake = this._getPromMetricLabeled(
+      txt,
+      "vllm:engine_sleep_state",
+      "sleep_state",
+      "awake"
+    );
+    if (awake != null) {
+      this.gpuMemoryUtilization = awake > 0 ? 1 : 0;
+    } else if (this.gpuMemoryUtilization == null) {
       const sleepState = this._getVllmMetric(txt, "engine_sleep_state");
       if (sleepState != null) this.gpuMemoryUtilization = sleepState;
     }
@@ -1300,6 +1757,7 @@ export class LlmProbe {
     const prompt =
       this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
       this._getPromMetric(txt, "sglang_prompt_tokens_total");
+
     const running =
       this._getPromMetric(txt, "sglang:num_running_reqs") ??
       this._getPromMetric(txt, "sglang_num_running_reqs");
@@ -1420,6 +1878,7 @@ export class LlmProbe {
 
   // ─── llama.cpp native path ────────────────────────────────
   async _probeLlamaCpp() {
+    this._llamaCumulative = null;
     const now = Date.now();
     const dtSec = (now - this.lastProbeTime) / 1000;
     this.lastProbeTime = now;
@@ -1452,19 +1911,30 @@ export class LlmProbe {
             const decoded = this._getSlotDecoded(slot);
             const prompted = this._getSlotPrefilled(slot);
             const cached = this._getSlotCached(slot);
+            const taskId = slot.id_task ?? null;
             totalDecoded += decoded;
             promptedSum += prompted;
-            if (cached != null) {
-              sawCache = true;
-              cachedSum += cached;
-            }
-            const lastState = this.slotState.get(slotId) || { decoded: 0, prompted: 0 };
+            if (cached != null) cachedSum += cached;
+            if (cached != null) sawCache = true;
+            const lastState = this.slotState.get(slotId);
+            this.slotState.set(slotId, { decoded, prompted, cached: cached ?? 0, taskId });
+            // Slot counters are per-task: a delta is only a rate while the
+            // same task stays on the slot. First contact and task switches
+            // contribute nothing this interval — otherwise a slot mid-task
+            // counts its whole history (largely prompt-cache hits) inside one
+            // poll and poisons the daily peaks with impossible tok/s spikes.
+            if (lastState == null || lastState.taskId !== taskId) continue;
+            if (!(dtSec > 0 && dtSec < 10)) continue;
             const dDecoded = decoded - lastState.decoded;
             const dPrompted = prompted - lastState.prompted;
-            this.slotState.set(slotId, { decoded, prompted });
-            if (dtSec > 0 && dtSec < 10) {
-              totalGen += dDecoded / dtSec;
+            if (dDecoded > 0) totalGen += dDecoded / dtSec;
+            if (dPrompted > 0) {
               totalPrefill += dPrompted / dtSec;
+              this._llamaComputedCum += dPrompted;
+            }
+            if (cached != null) {
+              const dCached = cached - (lastState.cached || 0);
+              if (dCached > 0) this._llamaCachedCum += dCached;
             }
           }
 
@@ -1473,7 +1943,7 @@ export class LlmProbe {
           if (sawCache) this.totalCachedTokens = cachedSum;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
-          if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
+          if (sawCache) this._setPrefillSplitRates(this._llamaCachedCum, this._llamaComputedCum, dtSec);
         }
       }
     } catch {}
@@ -1497,6 +1967,26 @@ export class LlmProbe {
         this.contextLength = props.total_context_length || props.context_length || this.contextLength;
       }
     } catch {}
+
+    // Monotonic token counter. The per-slot n_decoded sum resets whenever a
+    // slot picks up a new task, so it cannot be diffed into token volume.
+    if (this._llamaMetricsOk !== false) {
+      try {
+        const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+        if (metricsRes.ok) {
+          this._llamaMetricsOk = true;
+          const txt = await metricsRes.text();
+          const predicted = this._getPromMetric(txt, "llamacpp:tokens_predicted_total");
+          if (predicted != null && Number.isFinite(predicted)) {
+            this.totalOutputTokens = predicted;
+            this._llamaCumulative = predicted;
+          }
+        } else if (metricsRes.status === 404 || metricsRes.status === 501) {
+          // Server started without --metrics; stop asking every poll.
+          this._llamaMetricsOk = false;
+        }
+      } catch {}
+    }
 
     this.backendType = "llama.cpp";
     return this._getSnapshot();
@@ -1729,7 +2219,11 @@ export class LlmProbe {
   }
 
   _getSnapshot() {
-    const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
+    // A router with nothing resident is idle, not broken: show the empty-state
+    // panel instead of the last engine's numbers.
+    const routerIdle = this.router != null && this.engineId == null;
+    const metricsLive =
+      this.serverIsOpenAI !== null && this.authOpen !== false && !routerIdle;
     return {
       available: metricsLive,
       backend: this.backendType,
@@ -1746,6 +2240,8 @@ export class LlmProbe {
       totalOutputTokens: this.totalOutputTokens,
       totalPromptTokens: this.totalPromptTokens ?? null,
       totalCachedTokens: this.totalCachedTokens ?? null,
+      cumulativeOutputTokens:
+        this.backendType === "llama.cpp" ? this._llamaCumulative : this.totalOutputTokens,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
@@ -1756,6 +2252,14 @@ export class LlmProbe {
       e2eP95Seconds: this.e2eP95Seconds,
       itlP95Seconds: this.itlP95Seconds,
       mtpAcceptanceRate: this.mtpAcceptanceRate,
+      router: this.router,
+      routerModel: this.routerModel,
+      routerModelName: this.routerModelName,
+      routerLoading: this.routerLoading,
+      studio: this.studio,
+      engineId: this.engineId,
+      routerResident: this.routerResident,
+      routerEngines: this._routerEngines(),
       posture: this._buildPosture(),
       error: this.error,
     };
@@ -1787,6 +2291,14 @@ export class LlmProbe {
       e2eP95Seconds: null,
       itlP95Seconds: null,
       mtpAcceptanceRate: null,
+      router: this.router,
+      routerModel: null,
+      routerModelName: null,
+      routerLoading: this.routerLoading,
+      engineId: null,
+      studio: null,
+      routerResident: this.routerResident,
+      routerEngines: this._routerEngines(),
       posture: this._buildPosture(),
       error: this.error,
     };
@@ -1801,10 +2313,37 @@ export class LlmProbe {
     return key || null;
   }
 
-  async _fetch(url) {
+  /**
+   * The configured key belongs to the probe target. A router may name an
+   * upstream on another host; the key must not follow it there.
+   * @param {string} url
+   */
+  _sameHostAsProbe(url) {
+    try {
+      return new URL(url).hostname === new URL(this.baseUrl).hostname;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * @param {string} url
+   * @param {{ authenticated?: boolean }} [opts] `authenticated: false` sends no
+   *   credentials (probing an upstream origin the router merely names).
+   */
+  async _fetch(url, { authenticated = true } = {}) {
     const headers = {};
-    const apiKey = this._apiKey();
-    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS), headers });
+    const apiKey = authenticated ? this._apiKey() : null;
+    if (apiKey && this._sameHostAsProbe(url)) headers.Authorization = `Bearer ${apiKey}`;
+    // A 3xx is a failure, never followed: a redirect would carry the probe (and
+    // its credentials) to a host the operator did not approve.
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS),
+      headers,
+      redirect: "manual",
+    });
+    // Release a redirect's socket now instead of at the timeout; callers see !ok.
+    if (res.status >= 300 && res.status < 400) await res.body?.cancel().catch(() => {});
+    return res;
   }
 }

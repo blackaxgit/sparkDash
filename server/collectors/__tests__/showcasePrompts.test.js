@@ -11,6 +11,11 @@ import {
   withFillToMaxInstruction,
   stripFillForceFields,
 } from "../ShowcaseManager.js";
+import {
+  normalizeDecodeBenchType,
+  pickDecodeBenchPrompts,
+  DECODE_BENCH_PROMPTS,
+} from "../../../src/shared/llmPrompts.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const managerSrc = readFileSync(
@@ -91,6 +96,22 @@ test("catalog prompts exist for text, structural, and mixed pickers", () => {
   assert.ok(textCount >= 2);
 });
 
+test("DecodeBench prompts default to structured and stay unique per stream", () => {
+  assert.equal(normalizeDecodeBenchType(undefined), "structured");
+  assert.equal(normalizeDecodeBenchType("sideways"), "structured");
+  // C1 sends the catalog prompt verbatim so runs stay comparable.
+  assert.deepEqual(pickDecodeBenchPrompts(1), [DECODE_BENCH_PROMPTS.structured]);
+
+  const three = pickDecodeBenchPrompts(3, "prose");
+  assert.equal(three.length, 3);
+  assert.equal(
+    new Set(three).size,
+    3,
+    "concurrent streams must not share a prefix-cache block"
+  );
+  assert.ok(three.every((p) => p.startsWith(DECODE_BENCH_PROMPTS.prose)));
+});
+
 test("DecodeBench uses the lab structured protocol at temperature 0, thinking off", () => {
   // 1.8.3 moved DecodeBench off the Showcase structural catalog + fill-to-max
   // and onto the lab structured protocol (count 1 -> 200); 1.8.4 added the
@@ -101,8 +122,10 @@ test("DecodeBench uses the lab structured protocol at temperature 0, thinking of
   assert.match(benchSrc, /temperature:\s*0/);
   assert.match(benchSrc, /top_p:\s*1/);
   assert.match(benchSrc, /applyThinkingFlags\(body,\s*modelId,\s*false\)/);
+  // Full-length generation is forced by the request, not by prompt wording.
   assert.match(benchSrc, /min_tokens:\s*maxTokens/);
   assert.doesNotMatch(benchSrc, /withFillToMaxInstruction/);
   assert.doesNotMatch(benchSrc, /uniquePrefillPrefix/);
-  assert.doesNotMatch(benchSrc, /BENCH_PROMPTS/);
+  // Prompts come from the shared catalog; the bench defines none of its own.
+  assert.doesNotMatch(benchSrc, /const\s+\w*BENCH_PROMPTS\s*=/);
 });

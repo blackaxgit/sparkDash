@@ -68,7 +68,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Non-Spark GPU hosts** | Linux boxes with a dedicated NVIDIA GPU are first-class units: same `nvidia-smi` collectors over SSH, detected hardware summary, and separate **RAM** / **VRAM** panels. Detail page: GPU (left) + **RAM → Network → Storage** (right column); Overview cards show RAM and VRAM bars |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, or q27; live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27; **daily peak** history on the LLM card |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, EXL3, TensorFold, q27, or a llama-swap router (follows the engine that is actually loaded); live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, SGLang, and q27; **daily peak** history on the LLM card |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Hermes Agent** | Opt-in per unit: background update check (10 min), status badges, one-click or batch `hermes update` |
 | **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet |
@@ -559,8 +559,9 @@ Each configured LLM port gets its own `LlmProbe` instance running in parallel. P
 - **q27** (signalnine/q27 engine) — `/v1/models` (`owned_by: q27`) or Prometheus `q27_*` series; live tok/s from `q27_*_processed` counter diffs (completion-based totals as fallback), exact computed-only prefill with the cached/uncached split doubling as the prefix-cache hit rate, TTFT/E2E/ITL p95 histograms, and constant-0 preemptions (FIFO admission, no wait queue)
 - **TensorFold** (ashhart/TensorFold) — `/v1/models` (`owned_by: tensorfold`). It has no `/metrics`, and the CUDA server's `/health` is just `{ok: true}`, so live tok/s appears only when `/health` publishes cumulative `prompt_tokens_total` / `completion_tokens_total` (same contract as EXL3); otherwise the card shows the model and 0 tok/s. Decode/prefill benches and the showcase work regardless.
 - **vLLM / sglang** — `/v1/models`; sglang via `/server_info` (`last_gen_throughput` when metrics off; `/get_server_info` fallback), vLLM via Prometheus `/metrics` counters (scientific notation supported)
+- **llama-swap** (`owned_by: llama-swap`) — a router, not an engine: its `/v1/models` lists every configured model *and alias*, so identity comes from `GET /running` instead. The panel follows the most recently started resident engine (`process_start_time_seconds`), scrapes that engine directly, and shows a `llama-swap` chip, the resident-model count, and `loading <model>…` during a cold start. Every resident engine is scraped, so when more than one model holds memory the card lists each with its own tok/s and its own token counter
 
-Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). Multiple ports can be added or removed at runtime without restarting the monitor.
+Rates are derived from per-probe cumulative counter diffs (or SGLang sticky throughput while it moves). An engine is identified by `model@process_start_time_seconds`, so a swap or restart re-baselines the counters instead of reporting the reset as a burst. Multiple ports can be added or removed at runtime without restarting the monitor.
 
 Live probes still use the LAN IP on remote units. **Decode and prefill benches** try that same HTTP target first; if it is closed they open an SSH local-forward onto the remote’s `127.0.0.1` so loopback-bound servers (ds4 `start.sh` default) can still be measured. The tunnel is torn down when the job finishes or is cancelled.
 

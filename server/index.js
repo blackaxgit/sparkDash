@@ -42,6 +42,8 @@ import {
   llmTokenLedger,
 } from "./llmtokens/LlmTokenRuntime.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
+import { llmHourly } from "./collectors/LlmHourly.js";
+import { metricsHistory, MAX_SAMPLES } from "./collectors/MetricsHistory.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 import { FLEET_ENERGY_JSON_PATH } from "./config.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
@@ -974,6 +976,26 @@ app.get("/api/sparks/:id/llm/daily", (req, res) => {
 });
 
 /**
+ * Hourly generated-token volume (last 24 hours by default, 7 days retained).
+ * Query: port (required for multi-port), hours (1–168).
+ */
+app.get("/api/sparks/:id/llm/hourly", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const ports =
+    Array.isArray(spark.llmPorts) && spark.llmPorts.length
+      ? spark.llmPorts
+      : [resolveLlmPort(spark)];
+  let port = req.query.port != null ? Number(req.query.port) : ports[0];
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return res.status(400).json({ error: "Invalid port" });
+  }
+  let hours = req.query.hours != null ? Number(req.query.hours) : 24;
+  if (!Number.isFinite(hours)) hours = 24;
+  res.json(llmHourly.getSeries(spark.id, port, { hours }));
+});
+
+/**
  * Decode throughput benchmark (streaming, post-first-token tok/s).
  *
  * POST body: { port?, concurrencies: number[], maxTokens?, promptType? }
@@ -1622,6 +1644,24 @@ wss.on("connection", (ws) => {
   } catch {
     // The close handler will clean up a client that disappears during connect.
   }
+  // Then seed this client's sparkline history, so the charts open with the
+  // retained window instead of building up from an empty tab. Sent to this
+  // socket only — the other clients already have their series. The client
+  // replaces a series only when the server's copy is longer than its own.
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "history",
+        series: metricsHistory.getAll(),
+        // Sample timestamps, so the client can label the age of the leftmost
+        // point instead of inferring it from the sample count.
+        meta: metricsHistory.getMeta(),
+        max: MAX_SAMPLES,
+      })
+    );
+  } catch (err) {
+    console.error("[ws] history hydration failed:", err.message);
+  }
   ws.on("close", () => {
     console.log("[ws] client disconnected");
   });
@@ -1680,6 +1720,10 @@ function forceBroadcast() {
 function startBroadcast() {
   const interval = getSettings().pollIntervalMs;
   broadcastTimer = setInterval(() => {
+    // Record before the skip below: history must advance at a steady cadence
+    // even on an idle box whose snapshot happens to serialize identically.
+    // Only the timer feeds history — forceBroadcast() must not double-sample.
+    metricsHistory.recordSnapshot(orderedSnapshots());
     const payload = buildSnapshotPayload();
     // Skip the broadcast entirely when nothing changed since the last tick.
     // A 1s poll that produces identical snapshots becomes free for idle tabs.
@@ -1745,11 +1789,21 @@ async function shutdown(signal) {
   } catch (err) {
     console.error("[sparkDash] failed to flush LLM daily history:", err.message);
   }
+  try {
+    llmHourly.flush();
+  } catch (err) {
+    console.error("[sparkDash] failed to flush LLM hourly history:", err.message);
+  }
   llmTokenRuntime.stop();
   const energyPersistenceSucceeded = fleetEnergyRuntime.stop();
   const streamAgentClosedGracefully = await closeLlmStreamAgent();
   if (!streamAgentClosedGracefully) {
     console.warn("[sparkDash] LLM dispatcher close timed out; destroyed open sockets");
+  }
+  try {
+    metricsHistory.flush();
+  } catch (err) {
+    console.error("[sparkDash] failed to flush metrics history:", err.message);
   }
   try {
     if (broadcastTimer) {

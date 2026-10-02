@@ -35,6 +35,8 @@ const DEFAULTS = Object.freeze({
    * does not want it can turn it off here (see the README's settings table).
    */
   benchShareImage: true,
+  /** Services cards — side-by-side grid (default) or full-width rows. */
+  servicesLayout: "grid",
 });
 
 /** @type {typeof DEFAULTS} */
@@ -66,6 +68,10 @@ function _clampSettings(settings) {
   // Ensure density is valid
   if (s.density !== "comfortable" && s.density !== "compact") {
     s.density = DEFAULTS.density;
+  }
+  // Ensure servicesLayout is valid
+  if (s.servicesLayout !== "grid" && s.servicesLayout !== "rows") {
+    s.servicesLayout = DEFAULTS.servicesLayout;
   }
   return s;
 }

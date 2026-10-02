@@ -4,8 +4,9 @@ import type {
   FleetEnergy,
   HermesBatchUpdateResponse,
   HermesUpdatesResponse,
-  LlmMetrics,
   LlmDailyResponse,
+  LlmMetrics,
+  LlmHourlyResponse,
   Settings,
   ShowcaseListResponse,
   ShowcaseSessionState,
@@ -68,6 +69,16 @@ export function fetchLlmDaily(
 ): Promise<LlmDailyResponse> {
   const q = new URLSearchParams({ port: String(port), days: String(days) });
   return apiFetch(`/api/sparks/${encodeURIComponent(id)}/llm/daily?${q.toString()}`);
+}
+
+/** Hourly generated-token volume for one Spark LLM port. */
+export function fetchLlmHourly(
+  id: string,
+  port: number,
+  hours = 24
+): Promise<LlmHourlyResponse> {
+  const q = new URLSearchParams({ port: String(port), hours: String(hours) });
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/llm/hourly?${q.toString()}`);
 }
 
 export function addSpark(config: SparkConfig): Promise<{ success: boolean; spark: SparkConfig }> {

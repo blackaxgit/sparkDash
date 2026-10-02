@@ -4,6 +4,13 @@
  * Decode tok/s uses the first visible token → last visible token window
  * (not stream EOF), so trailing usage/[DONE] latency does not drag the rate down.
  */
+import {
+  parseRunning,
+  isReadyState,
+  upstreamBase,
+  processStartTime,
+  pickNewestEngine,
+} from "./swapRouter.js";
 
 import { Agent, fetch as undiciFetch } from "undici";
 
@@ -111,64 +118,101 @@ export function sleep(ms, signal) {
 }
 
 /**
+ * Cumulative generation tokens from a Prometheus body, whatever engine wrote
+ * it. null when no known series is present.
+ * @param {string} txt
+ * @returns {number | null}
+ */
+export function generationTokensFromMetrics(txt) {
+  const fromSeries = (re) => {
+    let sum = 0;
+    let found = false;
+    let m;
+    while ((m = re.exec(txt)) !== null) {
+      const v = parseFloat(m[1]);
+      if (Number.isFinite(v)) {
+        sum += v;
+        found = true;
+      }
+    }
+    return found ? sum : null;
+  };
+  return (
+    fromSeries(/^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    fromSeries(/^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    fromSeries(/^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    fromSeries(/^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    // q27 (signalnine/q27 engine) — live processed counter first, then the
+    // completion-based per-api total (same preference as LlmProbe).
+    fromSeries(/^q27_decode_tokens_processed_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    fromSeries(/^q27_decode_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm) ??
+    fromSeries(/^llamacpp:tokens_predicted_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm)
+  );
+}
+
+/**
  * Read cumulative generation (output) token counters from the server —
  * same sources as LlmProbe live tok/s.
  * @param {string} baseUrl
- * @param {{ apiKey?: string | null }} [opts]
+ * @param {{ apiKey?: string | null, modelId?: string | null }} [opts]
  * @returns {Promise<number | null>}
  */
 export async function readServerGenerationTokens(baseUrl, opts = {}) {
-  const headers = {};
   const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-
-  // Prometheus (vLLM or ds4-server) — prefer whichever series is present
-  try {
-    const res = await fetch(`${baseUrl}/metrics`, {
+  const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+  // The key belongs to the probe target. A router may name an upstream on
+  // another host; the key must not follow it there.
+  const sameHost = (url) => {
+    try {
+      return new URL(url).hostname === new URL(baseUrl).hostname;
+    } catch {
+      return false;
+    }
+  };
+  const get = (url) =>
+    fetch(url, {
       signal: AbortSignal.timeout(5_000),
-      headers,
+      headers: sameHost(url) ? headers : {},
     });
+
+  // Prometheus (vLLM / ds4-server / SGLang / llama.cpp)
+  try {
+    const res = await get(`${baseUrl}/metrics`);
     if (res.ok) {
-      const txt = await res.text();
-      const fromSeries = (re) => {
-        let sum = 0;
-        let found = false;
-        let m;
-        while ((m = re.exec(txt)) !== null) {
-          const v = parseFloat(m[1]);
-          if (Number.isFinite(v)) {
-            sum += v;
-            found = true;
-          }
+      const tokens = generationTokensFromMetrics(await res.text());
+      if (tokens != null) return tokens;
+    }
+  } catch {
+    /* try next */
+  }
+
+  // llama-swap: its own /metrics are host stats. Ask the engine running the
+  // model under test — falling back to the newest engine when unnamed.
+  try {
+    const res = await get(`${baseUrl}/running`);
+    if (res.ok) {
+      const rows = parseRunning(await res.json().catch(() => null)) || [];
+      const ready = rows.filter((r) => isReadyState(r.state) && r.proxy);
+      const wanted = opts?.modelId ? String(opts.modelId) : null;
+      const named = wanted ? ready.filter((r) => r.model === wanted) : [];
+      const candidates = [];
+      for (const row of named.length ? named : ready) {
+        const base = upstreamBase(row.proxy, baseUrl);
+        if (!base) continue;
+        try {
+          const up = await get(`${base}/metrics`);
+          if (!up.ok) continue;
+          const txt = await up.text();
+          candidates.push({ startedAt: processStartTime(txt), txt });
+        } catch {
+          /* try next engine */
         }
-        return found ? sum : null;
-      };
-      const ds4 = fromSeries(
-        /^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-      );
-      if (ds4 != null) return ds4;
-      const vllm = fromSeries(
-        /^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-      );
-      if (vllm != null) return vllm;
-      const sglang =
-        fromSeries(
-          /^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        ) ??
-        fromSeries(
-          /^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        );
-      if (sglang != null) return sglang;
-      // q27 (signalnine/q27 engine) — live processed counter first, then the
-      // completion-based per-api total (same preference as LlmProbe).
-      const q27 =
-        fromSeries(
-          /^q27_decode_tokens_processed_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        ) ??
-        fromSeries(
-          /^q27_decode_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        );
-      if (q27 != null) return q27;
+      }
+      const best = pickNewestEngine(candidates);
+      if (best) {
+        const tokens = generationTokensFromMetrics(best.txt);
+        if (tokens != null) return tokens;
+      }
     }
   } catch {
     /* try next */
@@ -176,10 +220,7 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
 
   // EXL3 serve_openai.py / TensorFold — cumulative completion tokens on /health
   try {
-    const res = await fetch(`${baseUrl}/health`, {
-      signal: AbortSignal.timeout(5_000),
-      headers,
-    });
+    const res = await get(`${baseUrl}/health`);
     if (res.ok) {
       const data = await res.json();
       const v = Number(data?.completion_tokens_total);
@@ -194,10 +235,7 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
   // SGLang — current /server_info first; /get_server_info is a deprecated alias.
   for (const path of ["/server_info", "/get_server_info"]) {
     try {
-      const res = await fetch(`${baseUrl}${path}`, {
-        signal: AbortSignal.timeout(5_000),
-        headers,
-      });
+      const res = await get(`${baseUrl}${path}`);
       if (res.ok) {
         const data = await res.json();
         if (data?.total_output_tokens != null) {
@@ -384,7 +422,7 @@ export function thinkingOffFallbackBody(body) {
  * @param {string} baseUrl
  * @param {AbortSignal} signal
  * @param {number} [intervalMs=400]
- * @param {{ onSample?: (info: { rate: number, median: number | null, max: number | null, samples: number }) => void, apiKey?: string | null }} [opts]
+ * @param {{ onSample?: (info: { rate: number, median: number | null, max: number | null, samples: number }) => void, apiKey?: string | null, modelId?: string | null }} [opts]
  * @returns {Promise<{ median: number | null, mean: number | null, max: number | null, samples: number }>}
  */
 export async function pollServerGenerationRates(
@@ -396,7 +434,9 @@ export async function pollServerGenerationRates(
   /** @type {number[]} */
   const rates = [];
   const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
-  let lastTokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
+  const modelId = opts?.modelId != null ? String(opts.modelId) : null;
+  const counterOpts = { apiKey: apiKey || null, modelId };
+  let lastTokens = await readServerGenerationTokens(baseUrl, counterOpts);
   let lastT = performance.now();
   const onSample = typeof opts.onSample === "function" ? opts.onSample : null;
 
@@ -407,7 +447,7 @@ export async function pollServerGenerationRates(
       break;
     }
     const now = performance.now();
-    const tokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
+    const tokens = await readServerGenerationTokens(baseUrl, counterOpts);
     if (tokens == null || lastTokens == null) {
       if (tokens != null) {
         lastTokens = tokens;
